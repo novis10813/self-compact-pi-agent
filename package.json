@@ -1,0 +1,9 @@
+{
+  "name": "pi-self-compact",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "pi": {
+    "extensions": ["./apps/self-compact/extensions/self-compact/self-compact.ts"]
+  }
+}

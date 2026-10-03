@@ -15,6 +15,13 @@ export interface Handoff {
 	attempts: number;
 	savedAt: number;
 	error?: string;
+	/**
+	 * Set when the handoff fails: whether the failure is eligible for an automatic retry —
+	 * a genuine (not cancelled) compaction failure that is not deterministic. Drives both the
+	 * scheduled retry and the settled-agent retry; undefined on handoffs that never failed
+	 * (and on snapshots from older versions), so restored failures only retry through recovery.
+	 */
+	retryable?: boolean;
 }
 
 export interface PersistedState {

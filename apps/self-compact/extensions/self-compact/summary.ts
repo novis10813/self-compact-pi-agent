@@ -1,12 +1,12 @@
 import { randomUUID } from "node:crypto";
+import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 import {
 	compact,
 	convertToLlm,
-	findCutPoint,
+	getPackageDir,
 	serializeConversation,
-	sessionEntryToContextMessages,
 	SettingsManager,
-	type CompactionEntry,
 	type ExtensionContext,
 	type SessionBeforeCompactEvent,
 	type SessionEntry,
@@ -15,46 +15,76 @@ import { createAssistantMessageEventStream, type Context } from "@earendil-works
 import type { LoadedPrompt } from "./prompts.ts";
 
 /**
- * Mirrors Pi's prepareCompaction(): true when a compaction of this branch would have at least one message to
- * summarize, false when Pi would fail with "Nothing to compact" (everything fits inside keepRecentTokens, or the
- * last entry is already a compaction).
+ * The fully resolved compaction settings Pi passes to prepareCompaction (model override > ordinary
+ * setting > built-in default). The root export named CompactionSettings is the *file* settings
+ * shape (optional fields + modelOverrides), not this resolved shape, so it is mirrored here with
+ * prepareCompaction's own parameter type name.
  */
-export function hasCompactionMaterial(entries: SessionEntry[], keepRecentTokens: number): boolean {
-	if (entries.length === 0 || entries[entries.length - 1]!.type === "compaction") return false;
-	let previous = -1;
-	for (let i = entries.length - 1; i >= 0; i--) {
-		if (entries[i]!.type === "compaction") {
-			previous = i;
-			break;
-		}
-	}
-	let boundaryStart = 0;
-	if (previous >= 0) {
-		const firstKept = entries.findIndex((entry) => entry.id === (entries[previous] as CompactionEntry).firstKeptEntryId);
-		boundaryStart = firstKept >= 0 ? firstKept : previous + 1;
-	}
-	const cut = findCutPoint(entries, boundaryStart, entries.length, keepRecentTokens);
-	const historyEnd = cut.isSplitTurn ? cut.turnStartIndex : cut.firstKeptEntryIndex;
-	for (let i = boundaryStart; i < historyEnd; i++) {
-		const entry = entries[i]!;
-		if (entry.type !== "compaction" && sessionEntryToContextMessages(entry).length > 0) return true;
-	}
-	if (cut.isSplitTurn) {
-		for (let i = cut.turnStartIndex; i < cut.firstKeptEntryIndex; i++) {
-			if (sessionEntryToContextMessages(entries[i]!).length > 0) return true;
-		}
-	}
-	return false;
+interface CompactionSettings {
+	enabled: boolean;
+	reserveTokens: number;
+	keepRecentTokens: number;
 }
 
-/** Pi's retained recent history for this working directory (global settings merged with the project's). */
-export function keepRecentTokens(cwd: string): number {
-	return SettingsManager.create(cwd).getCompactionKeepRecentTokens();
+/**
+ * Pi's own compaction preparation — the exact function agent-session.js calls
+ * (`prepareCompaction(getBranch(), getCompactionSettings(model))`) before every compaction run.
+ * Pi 1.0.0 does not re-export it from the package root. Resolve the internal module from Pi's
+ * public getPackageDir() instead of relying on extension-loader alias path tricks. This adapter
+ * requires a disk-based Pi installation and must be checked when upgrading Pi.
+ * Unsupported installations fail explicitly rather than silently disabling the precheck.
+ */
+const prepareModuleUrl = pathToFileURL(join(getPackageDir(), "dist/core/compaction/compaction.js")).href;
+type NativePrepareCompaction = (entries: SessionEntry[], settings: CompactionSettings) => unknown;
+let nativeModule: { prepareCompaction?: NativePrepareCompaction };
+try {
+	nativeModule = await import(prepareModuleUrl) as { prepareCompaction?: NativePrepareCompaction };
+} catch (error) {
+	throw new Error("self-compact requires Pi's native prepareCompaction API; this Pi installation is unsupported.", { cause: error });
+}
+if (typeof nativeModule.prepareCompaction !== "function") {
+	throw new Error("self-compact requires Pi's native prepareCompaction API; this Pi installation is unsupported.");
+}
+const nativePrepare = nativeModule.prepareCompaction;
+
+/**
+ * True when a compaction of this branch would have at least one message to summarize, false when
+ * Pi would fail with "Nothing to compact" or "Already compacted" (everything fits inside
+ * keepRecentTokens, or the leaf is a compaction entry). This is Pi's own prepareCompaction run on
+ * the raw branch with the fully resolved compaction settings — the same projection, cut point and
+ * token arithmetic the real compaction will use, including retained older compactions, context
+ * edits and recovery omissions.
+ */
+export function hasCompactionMaterial(entries: SessionEntry[], settings: CompactionSettings): boolean {
+	return nativePrepare(entries, settings) !== undefined;
+}
+
+/** Pi's full compaction settings for this working directory and active model (override > ordinary > built-in). */
+export function compactionSettings(cwd: string, model?: { provider: string; id: string }): CompactionSettings {
+	return SettingsManager.create(cwd).getCompactionSettings(model);
+}
+
+/**
+ * Pi's retained recent history for this working directory (global settings merged with the
+ * project's), resolved through the active model's overrides.
+ */
+export function keepRecentTokens(cwd: string, model?: { provider: string; id: string }): number {
+	return compactionSettings(cwd, model).keepRecentTokens;
 }
 
 function historyInput(messages: SessionBeforeCompactEvent["preparation"]["messagesToSummarize"], previous?: string): string {
 	const conversation = serializeConversation(convertToLlm(messages));
 	return `<conversation>\n${conversation}\n</conversation>\n\n${previous ? `<previous-summary>\n${previous}\n</previous-summary>\n\n` : ""}`;
+}
+
+/**
+ * Pi's turn-prefix prompt (generateTurnPrefixSummary in compaction.js) uses `# Conversation` /
+ * `# Instructions` headers instead of the `<conversation>` tags, so the prefix call must be
+ * matched in that format for the instruction replacement to recognize it.
+ */
+function turnPrefixInput(messages: SessionBeforeCompactEvent["preparation"]["turnPrefixMessages"]): string {
+	const conversation = serializeConversation(convertToLlm(messages));
+	return `# Conversation\n${conversation}\n\n# Instructions\n`;
 }
 
 function summaryInstructions(event: SessionBeforeCompactEvent, prompt: LoadedPrompt): string {
@@ -92,13 +122,16 @@ function replaceInstructions(context: Context, inputs: string[], instructions: s
 /** Pi owns split turns, summary updates, file tracking and configured transport retries. */
 export async function generateSummary(event: SessionBeforeCompactEvent, ctx: ExtensionContext, system: LoadedPrompt, instructions: LoadedPrompt) {
 	if (!ctx.model) throw new Error("No model available for compaction.");
-	const inputs = [historyInput(event.preparation.messagesToSummarize, event.preparation.previousSummary), historyInput(event.preparation.turnPrefixMessages)].sort((a, b) => b.length - a.length);
+	const inputs = [historyInput(event.preparation.messagesToSummarize, event.preparation.previousSummary), turnPrefixInput(event.preparation.turnPrefixMessages)].sort((a, b) => b.length - a.length);
 	const userInstructions = summaryInstructions(event, instructions);
 	let truncatedInput = false;
 	const result = await compact(
 		event.preparation, ctx.model, undefined, undefined, event.customInstructions, event.signal, ctx.thinkingLevel,
 		async (model, context, options) => {
-			const maxTokens = Math.min(options?.maxTokens ?? 8192, model.maxTokens || 8192, 8192);
+			// Pi computes the summary budget from reserveTokens (0.8x history, 0.5x turn prefix,
+			// already clamped by the model's output cap). Trust it — re-clamping here would
+			// silently defeat compaction.reserveTokens.
+			const maxTokens = options?.maxTokens ?? (model.maxTokens > 0 ? model.maxTokens : 8192);
 			const budgetChars = Math.max(8000, (model.contextWindow - maxTokens - 2000) * 4 - system.text.length - userInstructions.length);
 			const { messages, truncated } = replaceInstructions(context, inputs, userInstructions, budgetChars);
 			truncatedInput ||= truncated;

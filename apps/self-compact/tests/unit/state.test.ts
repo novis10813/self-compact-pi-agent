@@ -55,6 +55,16 @@ test("done handoff is left alone", () => {
 	assert.equal(r.state.cycle, 1);
 });
 
+test("retryable classification survives recovery; legacy snapshots stay unclassified", () => {
+	const transient = recoverState([snapshot({ handoff: note("failed", { attempts: 1, error: "transient", retryable: true }), locked: true })]);
+	assert.equal(transient.state.handoff?.status, "failed");
+	assert.equal(transient.state.handoff?.retryable, true);
+	const deterministic = recoverState([snapshot({ handoff: note("failed", { attempts: 1, error: "token cap", retryable: false }), locked: true })]);
+	assert.equal(deterministic.state.handoff?.retryable, false);
+	const legacy = recoverState([snapshot({ handoff: note("failed", { attempts: 1, error: "old failure" }), locked: true })]);
+	assert.equal(legacy.state.handoff?.retryable, undefined, "old snapshots have no classification: only recovery retries them");
+});
+
 test("latestAssistantUsage ignores pre-compaction, aborted, and zero usage", () => {
 	const good: EntryLike = { type: "message", message: { role: "assistant", stopReason: "stop", usage: { input: 10, output: 5, cacheRead: 10, cacheWrite: 0, totalTokens: 25 } } };
 	const aborted: EntryLike = { type: "message", message: { role: "assistant", stopReason: "aborted", usage: { input: 99, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 100 } } };
