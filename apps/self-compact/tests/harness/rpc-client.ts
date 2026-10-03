@@ -2,8 +2,8 @@
  * Minimal RPC client for `pi --mode rpc` (strict LF-delimited JSONL).
  */
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { mkdirSync, appendFileSync } from "node:fs";
-import { dirname } from "node:path";
+import { mkdirSync, appendFileSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 
 export interface RpcEvent {
 	type: string;
@@ -31,9 +31,13 @@ export class RpcClient {
 	constructor(options: RpcClientOptions) {
 		this.options = options;
 		if (options.logFile) mkdirSync(dirname(options.logFile), { recursive: true });
+		// Never inherit the host's global selfCompact settings or package configuration.
+		const agentDir = join(options.cwd, ".test-agent");
+		mkdirSync(agentDir, { recursive: true });
+		writeFileSync(join(agentDir, "settings.json"), "{}");
 		this.proc = spawn("pi", ["--mode", "rpc", ...options.args], {
 			cwd: options.cwd,
-			env: { ...process.env, PI_SKIP_VERSION_CHECK: "1", PI_OFFLINE: "1", ...options.env },
+			env: { ...process.env, PI_SKIP_VERSION_CHECK: "1", PI_OFFLINE: "1", PI_CODING_AGENT_DIR: agentDir, ...options.env },
 			stdio: ["pipe", "pipe", "pipe"],
 		});
 		this.proc.stdout.setEncoding("utf8");

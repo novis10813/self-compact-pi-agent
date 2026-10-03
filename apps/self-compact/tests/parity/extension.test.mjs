@@ -29,7 +29,10 @@ function seedEntries(chars = 2000) {
   ];
 }
 
-async function host(t, flags = {}, settings = { compaction: { keepRecentTokens: 100 } }, model) {
+async function host(t, flags = {}, settings = { compaction: { keepRecentTokens: 100 } }, model, options = {}) {
+  const globalPath = join(process.env.PI_CODING_AGENT_DIR, 'settings.json');
+  writeFileSync(globalPath, options.globalSettingsText ?? JSON.stringify(options.globalSettings ?? {}));
+  t.after(() => writeFileSync(globalPath, '{}'));
   const cwd = mkdtempSync(join(tmpdir(), 'self-compact-parity-'));
   mkdirSync(join(cwd, '.pi'), { recursive: true });
   writeFileSync(join(cwd, '.pi', 'settings.json'), JSON.stringify(settings));
@@ -40,7 +43,8 @@ async function host(t, flags = {}, settings = { compaction: { keepRecentTokens: 
   const footerCalls = [], statusCalls = [];
   let tokens = 0;
   let lastEntryId = entries[entries.length - 1].id;
-  for (const [key, value] of Object.entries({ 'compact-soft-at': '20%', 'compact-at': '50%', 'compact-buffer': '10%', ...flags })) loaded.runtime.flagValues.set(key, value);
+  const defaultFlags = options.useDefaultFlags === false ? {} : { 'compact-soft-at': '20%', 'compact-at': '50%', 'compact-buffer': '10%' };
+  for (const [key, value] of Object.entries({ ...defaultFlags, ...flags })) loaded.runtime.flagValues.set(key, value);
   // Appended entries join the session tree (real Pi chains every entry off the leaf), so the raw
   // branch returned by getBranch() walks through them.
   loaded.runtime.appendEntry = (customType, data) => {
@@ -883,4 +887,86 @@ test('P8: pending note with no material: explicit tool retry self-heals', async 
   assert.equal(h.messages[0].content, original);
   await h.emit('agent_settled');
   assert.equal(h.messages.length, 1, 'no duplicate delivery');
+});
+
+const configView = async h => JSON.parse((await h.view()).content[0].text);
+const thresholdTokens = view => Object.values(view.thresholds).map(value => value.tokens);
+const settingsHost = (t, config, flags = {}, projectSettings, extra = {}) => host(t, flags, projectSettings, undefined, { useDefaultFlags: false, globalSettings: { selfCompact: config }, ...extra });
+
+test('settings: global percentages, numeric tokens and mixed units resolve directly', async t => {
+  for (const [config, expected] of [
+    [{ noticeAt: '10%', warningAt: '20%', hardAt: '30%' }, [20000, 40000, 60000]],
+    [{ noticeAt: 20000, warningAt: 50000, hardAt: 70000 }, [20000, 50000, 70000]],
+    [{ noticeAt: '10%', warningAt: 50000, hardAt: '40%' }, [20000, 50000, 80000]],
+  ]) {
+    const h = await settingsHost(t, config);
+    const view = await configView(h);
+    assert.equal(view.settings_error, null);
+    assert.deepEqual(thresholdTokens(view), expected);
+    await h.info();
+    assert.deepEqual(h.entries.at(-1).data.settings.sources, { softAt: 'settings', at: 'settings', buffer: 'default', hardAt: 'settings' });
+    assert.match(h.entries.at(-1).data.lines.join('\n'), /hardAt .*settings, direct/);
+    assert.equal(h.footerCalls.length + h.statusCalls.length, 0);
+  }
+});
+
+test('settings: partial configuration uses defaults and preserves legacy CLI precedence', async t => {
+  const partial = await settingsHost(t, { noticeAt: '5%' });
+  assert.deepEqual(thresholdTokens(await configView(partial)), [10000, 40000, 60000]);
+  await partial.info();
+  assert.equal(partial.entries.at(-1).data.settings.sources.hardAt, 'default');
+  const direct = await settingsHost(t, { noticeAt: 'bad', warningAt: 'bad', hardAt: '50%' }, { 'compact-soft-at': '15%', 'compact-at': '40%' });
+  assert.deepEqual(thresholdTokens(await configView(direct)), [30000, 80000, 100000]);
+  const additive = await settingsHost(t, { hardAt: 'bad' }, { 'compact-at': '40%', 'compact-buffer': '5%' });
+  assert.deepEqual(thresholdTokens(await configView(additive)), [20000, 80000, 90000]);
+  await additive.info();
+  assert.equal(additive.entries.at(-1).data.settings.hardAt, undefined);
+  assert.match(additive.entries.at(-1).data.lines.join('\n'), /warning \+ buffer/);
+  const legacy = await settingsHost(t, {}, { 'compact-at': '40%' });
+  assert.deepEqual(thresholdTokens(await configView(legacy)), [20000, 80000, 100000]);
+});
+
+test('settings: rejected values, ordering and malformed global JSON remain blocked', async t => {
+  for (const config of [null, [], { noticeAt: '10000' }, { noticeAt: 1.5 }, { noticeAt: '30%', warningAt: '20%' }, { warningAt: '40%', hardAt: '30%' }, { warningAt: 100000, hardAt: '30%' }]) {
+    const h = await settingsHost(t, config);
+    assert.ok((await configView(h)).settings_error);
+    assert.equal(await h.emit('tool_call', { toolName: 'view_context' }), undefined);
+    assert.equal((await h.emit('tool_call', { toolName: 'self_compact' })).block, true);
+    const blocked = await h.emit('tool_call', { toolName: 'read' });
+    assert.equal(blocked.block, true);
+    assert.match(blocked.reason, /selfCompact settings or --compact-\* flags/);
+    assert.equal(h.requests.length, 0);
+  }
+  const broken = await settingsHost(t, {}, {}, undefined, { globalSettingsText: '{broken' });
+  assert.match((await configView(broken)).settings_error, /Cannot read selfCompact settings.*settings.json/);
+  assert.equal((await broken.emit('tool_call', { toolName: 'read' })).block, true);
+  assert.equal(await broken.emit('tool_call', { toolName: 'view_context' }), undefined);
+  const blankPrompt = await settingsHost(t, {}, { 'compact-prompt': ' ' });
+  assert.match((await configView(blankPrompt)).settings_error, /--compact-prompt must not be empty/);
+});
+
+test('settings: project selfCompact is ignored and model changes re-resolve mixed units', async t => {
+  const h = await settingsHost(t, { noticeAt: '10%', warningAt: 50000, hardAt: '40%' }, {}, { selfCompact: { noticeAt: 'bad' }, compaction: { keepRecentTokens: 100 } });
+  assert.deepEqual(thresholdTokens(await configView(h)), [20000, 50000, 80000]);
+  h.ctx.model = { ...h.ctx.model, contextWindow: 400000 };
+  await h.emit('model_select');
+  assert.deepEqual(thresholdTokens(await configView(h)), [40000, 50000, 160000]);
+  h.ctx.model = { ...h.ctx.model, contextWindow: 100000 };
+  await h.emit('model_select');
+  assert.match((await configView(h)).settings_error, /must not be below/);
+  h.ctx.model = { ...h.ctx.model, contextWindow: 400000 };
+  await h.emit('model_select');
+  assert.equal((await configView(h)).settings_error, null);
+});
+
+test('settings: session switch rereads configuration and clears previous errors', async t => {
+  const h = await settingsHost(t, { noticeAt: 'bad' });
+  assert.ok((await configView(h)).settings_error);
+  writeFileSync(join(process.env.PI_CODING_AGENT_DIR, 'settings.json'), JSON.stringify({ selfCompact: { noticeAt: 10000, warningAt: 30000, hardAt: 50000 } }));
+  // Pi emits session_start with reason "switch" after changing sessions.
+  await h.emit('session_start', { reason: 'switch' });
+  assert.equal((await configView(h)).settings_error, null);
+  assert.deepEqual(thresholdTokens(await configView(h)), [10000, 30000, 50000]);
+  await h.info();
+  assert.equal(h.entries.at(-1).data.settings.sources.hardAt, 'settings');
 });

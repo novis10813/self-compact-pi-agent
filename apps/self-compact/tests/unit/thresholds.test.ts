@@ -11,7 +11,7 @@ import {
 
 const MILLION = 1_000_000;
 
-function resolveOk(specs: { softAt: string; at: string; buffer: string }, window: number, fromDefaults = false): ResolvedThresholds {
+function resolveOk(specs: { softAt: string; at: string; buffer: string; hardAt?: string }, window: number, fromDefaults = false): ResolvedThresholds {
 	const result = resolveThresholds(specs, window, { fromDefaults });
 	if (!result.ok) throw new Error(result.error);
 	return result.thresholds;
@@ -110,4 +110,65 @@ test("levelFor maps tokens to levels and unknown for null", () => {
 	assert.equal(levelFor(59_999, t), "warning");
 	assert.equal(levelFor(60_000, t), "forced");
 	assert.equal(levelFor(100_000, t), "forced");
+});
+
+test("direct hardAt sets the cutoff and derives the buffer as the gap", () => {
+	const t = resolveOk({ softAt: "10%", at: "20%", buffer: "10%", hardAt: "30%" }, MILLION);
+	assert.equal(t.forcedTokens, 300_000);
+	assert.equal(t.bufferTokens, 100_000, "buffer is the derived gap, not the spec");
+	assert.equal(t.clamped, false);
+	assert.deepEqual(t.notes, []);
+});
+
+test("direct hardAt ignores the additive buffer string, even 0", () => {
+	const t = resolveOk({ softAt: "10%", at: "20%", buffer: "50%", hardAt: "25%" }, MILLION);
+	assert.equal(t.forcedTokens, 250_000);
+	assert.equal(t.bufferTokens, 50_000);
+	const zero = resolveOk({ softAt: "10%", at: "20%", buffer: "0", hardAt: "30%" }, MILLION);
+	assert.equal(zero.forcedTokens, 300_000);
+	assert.equal(zero.bufferTokens, 100_000);
+});
+
+test("direct hardAt above the 90% cap is capped with a note (percent and token units)", () => {
+	const pct = resolveOk({ softAt: "10%", at: "20%", buffer: "10%", hardAt: "95%" }, MILLION);
+	assert.equal(pct.forcedTokens, 900_000);
+	assert.equal(pct.bufferTokens, 700_000);
+	assert.ok(pct.notes.some((n) => n.includes("capped")));
+	const tokens = resolveOk({ softAt: "10%", at: "20%", buffer: "10%", hardAt: "950k" }, MILLION);
+	assert.equal(tokens.forcedTokens, 900_000);
+	assert.ok(tokens.notes.some((n) => n.includes("capped")));
+});
+
+test("direct hardAt exactly at the cap is not capped", () => {
+	const t = resolveOk({ softAt: "10%", at: "20%", buffer: "10%", hardAt: "90%" }, MILLION);
+	assert.equal(t.forcedTokens, 900_000);
+	assert.deepEqual(t.notes, []);
+});
+
+test("direct hardAt below the warning is rejected (same units at load, mixed units at resolve)", () => {
+	assert.throws(() => validateSpecs({ softAt: "10%", at: "20%", buffer: "10%", hardAt: "15%" }), /must not be below/);
+	assert.throws(() => validateSpecs({ softAt: "100k", at: "200k", buffer: "10k", hardAt: "150k" }), /must not be below/);
+	// Mixed units pass load-time validation but fail at resolve: 15% of 1M = 150k < 200k.
+	const mixed = resolveThresholds({ softAt: "100k", at: "200k", buffer: "10k", hardAt: "15%" }, MILLION);
+	assert.equal(mixed.ok, false);
+	if (!mixed.ok) assert.match(mixed.error, /must not be below/);
+	// Mixed units, valid ordering: 20% of 1M = 200k >= 150k.
+	const ok = resolveOk({ softAt: "100k", at: "150k", buffer: "10k", hardAt: "20%" }, MILLION);
+	assert.equal(ok.forcedTokens, 200_000);
+	assert.equal(ok.bufferTokens, 50_000);
+});
+
+test("direct hardAt clamped to the warning only when fromDefaults", () => {
+	const clamped = resolveOk({ softAt: "10%", at: "20%", buffer: "10%", hardAt: "15%" }, MILLION, true);
+	assert.equal(clamped.forcedTokens, 200_000);
+	assert.equal(clamped.bufferTokens, 0);
+	assert.equal(clamped.clamped, true);
+	assert.ok(clamped.notes.some((n) => n.includes("clamped")));
+});
+
+test("legacy additive mode is unchanged when hardAt is absent", () => {
+	const t = resolveOk({ softAt: "10%", at: "20%", buffer: "10%" }, MILLION);
+	assert.equal(t.forcedTokens, 300_000);
+	assert.equal(t.bufferTokens, 100_000);
+	assert.equal(t.clamped, false);
 });

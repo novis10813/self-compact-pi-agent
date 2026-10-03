@@ -17,7 +17,41 @@ pi -e extensions/self-compact/self-compact.ts --compact-soft-at 100k --compact-a
 | `--compact-buffer` | allowance above the warning before every other tool is blocked (`0` = block at the warning) | `10%` (hard cutoff 30%) |
 | `--compact-prompt` | literal text that replaces the compaction summary system prompt | unset |
 
-Values are percentages of the model window (`20%`) or token counts (`270000`, `100k`, `1.5m`). The hard cutoff is `min(warning + buffer, 90% of the window)`. Defaults live in `extensions/self-compact/defaults.ts`. Invalid settings are rejected: `/self-compact-info` reports the error and every tool is blocked until the flags are fixed.
+CLI values are percentages of the model window (`20%`) or token counts (`270000`, `100k`, `1.5m`). In legacy CLI mode the hard cutoff is `min(warning + buffer, 90% of the window)`. Defaults live in `extensions/self-compact/defaults.ts`.
+
+## Global settings
+
+Add `selfCompact` to `~/.pi/agent/settings.json` (or the agent directory selected by `PI_CODING_AGENT_DIR`):
+
+```json
+{
+  "selfCompact": {
+    "noticeAt": "10%",
+    "warningAt": "20%",
+    "hardAt": "30%"
+  }
+}
+```
+
+Percentage strings refer to the active model's context window. Integer numbers are absolute token counts, and the two units can be mixed:
+
+```json
+{
+  "selfCompact": {
+    "noticeAt": 50000,
+    "warningAt": 100000,
+    "hardAt": 120000
+  }
+}
+```
+
+Token numbers must be non-negative safe integers. String token counts (`"50000"`) and k/m suffixes are CLI-only, not settings values. Missing settings fields default to 10%, 20%, and 30%. Only global settings are read. Project `.pi/settings.json` does not override this section, and Pi's own `compaction` settings remain independent.
+
+`hardAt` is a direct threshold, not a buffer above `warningAt`. Thresholds must satisfy `noticeAt <= warningAt <= hardAt`. The hard cutoff is capped at 90% of the window with a diagnostic note. A warning above that cap is rejected. Percentages re-resolve on model changes, while token counts stay fixed and may become invalid on a smaller model.
+
+CLI flags take priority per field: `--compact-soft-at` overrides `noticeAt`, and `--compact-at` overrides `warningAt`. An explicit `--compact-buffer` replaces direct `hardAt` with warning + buffer. Without a configured `hardAt`, an explicit `--compact-at` retains the legacy warning + default buffer behavior. With no `selfCompact` section, all previous CLI behavior is preserved.
+
+Settings are read at session start, session switch, tree navigation, or extension reload. `/self-compact-info` reports effective values, sources and errors. Invalid settings or flags block ordinary tools until fixed and reloaded, but `view_context` remains available. This configuration does not change or integrate with the footer.
 
 ## Tools and commands
 

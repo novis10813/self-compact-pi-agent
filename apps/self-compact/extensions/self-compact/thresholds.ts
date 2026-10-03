@@ -14,12 +14,14 @@ import { DEFAULT_SPECS, HARD_CAP_FRACTION, type ThresholdSpecs } from "./default
 
 export { DEFAULT_SPECS, HARD_CAP_FRACTION, type ThresholdSpecs };
 
-export type SpecSource = "flag" | "default";
+export type SpecSource = "flag" | "default" | "settings";
 
 export interface ThresholdSpecSources {
 	softAt: SpecSource;
 	at: SpecSource;
 	buffer: SpecSource;
+	/** Present only when specs.hardAt is set — direct mode (settings or default). */
+	hardAt?: SpecSource;
 }
 
 export const SPEC_HELP = "Use whole tokens (270000), k/m suffixes (100k, 1.5m), or a percentage (20%).";
@@ -53,21 +55,27 @@ export interface ParsedSpecs {
 	soft: TokenSpec;
 	warn: TokenSpec;
 	buffer: TokenSpec;
+	/** Direct mode (selfCompact.hardAt); absent in legacy additive mode. */
+	hard?: TokenSpec;
 }
 
-/** Parse all three specs. Throws on the first invalid value. */
+/** Parse all specs (plus hardAt when set). Throws on the first invalid value. */
 export function parseSpecs(specs: ThresholdSpecs): ParsedSpecs {
-	return {
+	const parsed: ParsedSpecs = {
 		soft: parseTokenSpec(specs.softAt, "--compact-soft-at"),
 		warn: parseTokenSpec(specs.at, "--compact-at"),
 		buffer: parseTokenSpec(specs.buffer, "--compact-buffer"),
 	};
+	if (specs.hardAt !== undefined) parsed.hard = parseTokenSpec(specs.hardAt, "selfCompact.hardAt");
+	return parsed;
 }
 
 /**
  * Load-time validation (no model window needed). Rejects what can be rejected
  * without knowing the window: percent above the cap, and same-unit ordering
- * violations. Mixed units are checked later by resolveThresholds().
+ * violations (soft <= warn, and hard >= warn in direct mode). Mixed units are
+ * checked later by resolveThresholds(); a hardAt above the 90% cap is not
+ * rejected — resolveThresholds() caps it with a note.
  */
 export function validateSpecs(specs: ThresholdSpecs): ParsedSpecs {
 	const parsed = parseSpecs(specs);
@@ -81,6 +89,11 @@ export function validateSpecs(specs: ThresholdSpecs): ParsedSpecs {
 	if (parsed.soft.kind === parsed.warn.kind && parsed.soft.value > parsed.warn.value) {
 		throw new Error(
 			`Invalid thresholds: --compact-soft-at (${parsed.soft.raw}) must not exceed --compact-at (${parsed.warn.raw}).`,
+		);
+	}
+	if (parsed.hard && parsed.hard.kind === parsed.warn.kind && parsed.hard.value < parsed.warn.value) {
+		throw new Error(
+			`Invalid selfCompact.hardAt (${parsed.hard.raw}) must not be below the warning threshold (${parsed.warn.raw}).`,
 		);
 	}
 	return parsed;
@@ -114,8 +127,9 @@ export function pctOf(tokens: number, window: number): number {
 
 /**
  * Resolve specs against a model window.
- * - forced = min(warn + buffer, cap) where cap = floor(0.9 * window)
- * - explicit settings that violate soft <= warn <= cap are rejected
+ * - additive mode (no hardAt): forced = min(warn + buffer, cap) where cap = floor(0.9 * window)
+ * - direct mode (hardAt set): forced = min(hard, cap); the buffer is the derived gap forced - warn
+ * - explicit settings that violate soft <= warn <= cap (and hard >= warn) are rejected
  * - defaults that do not fit a small window are clamped with a note
  */
 export function resolveThresholds(
@@ -165,9 +179,35 @@ export function resolveThresholds(
 			};
 		}
 	}
-	const forcedTokens = Math.min(warnTokens + bufferTokens, capTokens);
-	if (warnTokens + bufferTokens > capTokens) {
-		notes.push(`Forced threshold capped at ${HARD_CAP_FRACTION * 100}% (${capTokens} tokens).`);
+	let forcedTokens: number;
+	let resolvedBufferTokens: number;
+	if (parsed.hard) {
+		let hardTokens = toTokens(parsed.hard, contextWindow);
+		if (hardTokens < warnTokens) {
+			if (options.fromDefaults) {
+				notes.push(`Default selfCompact.hardAt (${parsed.hard.raw}) is below the warning threshold; clamped to ${warnTokens}.`);
+				hardTokens = warnTokens;
+				clamped = true;
+			} else {
+				return {
+					ok: false,
+					error: `Invalid selfCompact.hardAt (${parsed.hard.raw} = ${hardTokens} tokens) must not be below the warning threshold (${parsed.warn.raw} = ${warnTokens} tokens).`,
+				};
+			}
+		}
+		forcedTokens = Math.min(hardTokens, capTokens);
+		if (hardTokens > capTokens) {
+			notes.push(
+				`Hard cutoff (${parsed.hard.raw} = ${hardTokens} tokens) exceeds the ${HARD_CAP_FRACTION * 100}% cap of this ${contextWindow}-token window; capped at ${capTokens}.`,
+			);
+		}
+		resolvedBufferTokens = forcedTokens - warnTokens;
+	} else {
+		forcedTokens = Math.min(warnTokens + bufferTokens, capTokens);
+		if (warnTokens + bufferTokens > capTokens) {
+			notes.push(`Forced threshold capped at ${HARD_CAP_FRACTION * 100}% (${capTokens} tokens).`);
+		}
+		resolvedBufferTokens = bufferTokens;
 	}
 	return {
 		ok: true,
@@ -176,7 +216,7 @@ export function resolveThresholds(
 			capTokens,
 			softTokens,
 			warnTokens,
-			bufferTokens,
+			bufferTokens: resolvedBufferTokens,
 			forcedTokens,
 			softPct: pctOf(softTokens, contextWindow),
 			warnPct: pctOf(warnTokens, contextWindow),

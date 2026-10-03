@@ -24,7 +24,8 @@
 import { randomUUID } from "node:crypto";
 import { dirname } from "node:path";
 import { fileURLToPath } from "node:url";
-import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { SettingsManager, getAgentDir, type ExtensionAPI, type ExtensionCommandContext, type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { resolveSelfCompactSettings } from "./settings.ts";
 import { compactionSettings, generateSummary, hasCompactionMaterial, keepRecentTokens } from "./summary.ts";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
 import { Text } from "@earendil-works/pi-tui";
@@ -59,7 +60,7 @@ import {
 	SPEC_HELP,
 	validateSpecs,
 	type ResolvedThresholds,
-	type SpecSource,
+	type ThresholdSpecSources,
 	type ThresholdSpecs,
 	type UsageLevel,
 } from "./thresholds.ts";
@@ -94,7 +95,7 @@ interface UsageSnapshot {
 
 interface Runtime {
 	specs: ThresholdSpecs;
-	sources: { softAt: SpecSource; at: SpecSource; buffer: SpecSource };
+	sources: ThresholdSpecSources;
 	fromDefaults: boolean;
 	compactPromptFlag?: string;
 	configError?: string;
@@ -172,13 +173,10 @@ export default function selfCompact(pi: ExtensionAPI) {
 	};
 
 	/** CLI flag values are applied after extensions load, so settings are read at session start. */
-	function loadSettings() {
-		const softFlag = flag("compact-soft-at");
-		const atFlag = flag("compact-at");
-		const bufferFlag = flag("compact-buffer");
-		R.specs = { softAt: softFlag ?? DEFAULT_SPECS.softAt, at: atFlag ?? DEFAULT_SPECS.at, buffer: bufferFlag ?? DEFAULT_SPECS.buffer };
-		R.sources = { softAt: softFlag ? "flag" : "default", at: atFlag ? "flag" : "default", buffer: bufferFlag ? "flag" : "default" };
-		R.fromDefaults = !softFlag && !atFlag && !bufferFlag;
+	function loadSettings(ctx: ExtensionContext) {
+		R.specs = { ...DEFAULT_SPECS };
+		R.sources = { softAt: "default", at: "default", buffer: "default" };
+		R.fromDefaults = true;
 		R.compactPromptFlag = flag("compact-prompt");
 		R.configError = undefined;
 		try {
@@ -186,7 +184,17 @@ export default function selfCompact(pi: ExtensionAPI) {
 				const value = pi.getFlag(name);
 				if (typeof value === "string" && !value.trim()) throw new Error(`--${name} must not be empty.`);
 			}
-			validateSpecs(R.specs);
+			const manager = SettingsManager.create(ctx.cwd, getAgentDir(), { projectTrusted: false });
+			const loadError = manager.drainErrors().find((error) => error.scope === "global");
+			if (loadError) throw new Error(`Cannot read selfCompact settings from ${loadError.path ?? "global settings.json"}: ${loadError.error.message}`);
+			const settings = manager.getGlobalSettings() as unknown as Record<string, unknown>;
+			const resolved = resolveSelfCompactSettings(settings.selfCompact, {
+				softAt: flag("compact-soft-at"), at: flag("compact-at"), buffer: flag("compact-buffer"),
+			});
+			validateSpecs(resolved.specs);
+			R.specs = resolved.specs;
+			R.sources = resolved.sources;
+			R.fromDefaults = resolved.fromDefaults;
 		} catch (error) {
 			R.configError = error instanceof Error ? error.message : String(error);
 			process.stderr.write(`[self-compact] REJECTED: ${R.configError}\n`);
@@ -436,7 +444,10 @@ export default function selfCompact(pi: ExtensionAPI) {
 		const fmt = (n: number) => n.toLocaleString("en-US");
 		const problem = inert();
 		const lines: string[] = ["self-compact info"];
-		lines.push(`settings: --compact-soft-at ${R.specs.softAt} (${R.sources.softAt}), --compact-at ${R.specs.at} (${R.sources.at}), --compact-buffer ${R.specs.buffer} (${R.sources.buffer}), --compact-prompt ${R.compactPromptFlag ? `set (${R.compactPromptFlag.length} chars)` : "unset"}`);
+		const hardSetting = R.specs.hardAt !== undefined
+			? `hardAt ${R.specs.hardAt} (${R.sources.hardAt}, direct)`
+			: `--compact-buffer ${R.specs.buffer} (${R.sources.buffer}, warning + buffer)`;
+		lines.push(`settings: noticeAt ${R.specs.softAt} (${R.sources.softAt}), warningAt ${R.specs.at} (${R.sources.at}), ${hardSetting}, --compact-prompt ${R.compactPromptFlag ? `set (${R.compactPromptFlag.length} chars)` : "unset"}`);
 		if (problem) lines.push(`REJECTED: ${problem} (extension is inert; every tool is blocked until fixed)`);
 		lines.push(`model: ${model}, window ${fmt(R.usage.window)} tokens, cap ${t ? fmt(t.capTokens) : "?"} (90%)`);
 		if (t) {
@@ -683,10 +694,10 @@ export default function selfCompact(pi: ExtensionAPI) {
 		R.compactionInFlight = false;
 		R.lastCompactionError = undefined; // in-memory attempt state does not cross session boundaries
 		R.searchDirs = promptSearchDirs(ctx.cwd, EXTENSION_DIR);
-		loadSettings();
+		loadSettings(ctx);
 		resolve(ctx);
 		const problem = inert();
-		if (problem) notify(ctx, `self-compact REJECTED settings: ${problem}. Every tool is blocked until the flags are fixed.`, "error");
+		if (problem) notify(ctx, `self-compact REJECTED settings: ${problem}. Every tool is blocked until the settings or flags are fixed.`, "error");
 
 		const recovered = recoverState(ctx.sessionManager.getBranch() as never[]);
 		R.state = recovered.state;
@@ -787,11 +798,11 @@ export default function selfCompact(pi: ExtensionAPI) {
 
 	pi.on("tool_call", async (event, ctx) => {
 		trackLevel(ctx);
-		const problem = inert();
-		if (problem) return { block: true, reason: `self-compact rejected its settings, so this session is not protected: ${problem}. Fix the --compact-* flags and restart.` };
-		if (event.toolName === TOOL_NAME) return undefined;
-		// Looking at the gauge is always allowed, even while every other tool is locked.
+		// Looking at the gauge is always allowed, including when settings are rejected.
 		if (event.toolName === VIEW_TOOL_NAME) return undefined;
+		const problem = inert();
+		if (problem) return { block: true, reason: `self-compact rejected its settings, so this session is not protected: ${problem}. Fix the selfCompact settings or --compact-* flags and reload.` };
+		if (event.toolName === TOOL_NAME) return undefined;
 		// Whole-batch preflight: Pi preflights siblings sequentially before running them concurrently,
 		// so an ordinary tool before or after self_compact in the same assistant message is blocked too.
 		const branch = ctx.sessionManager.getBranch();

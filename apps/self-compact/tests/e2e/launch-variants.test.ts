@@ -27,7 +27,7 @@ test("launch 1: defaults on a 1M model resolve to 100k / 200k / 300k (10% / 20% 
 	});
 	try {
 		const { text, events } = await info(client);
-		assert.match(text, /--compact-soft-at 10% \(default\), --compact-at 20% \(default\), --compact-buffer 10% \(default\), --compact-prompt unset/);
+		assert.match(text, /noticeAt 10% \(default\), warningAt 20% \(default\), --compact-buffer 10% \(default, warning \+ buffer\), --compact-prompt unset/);
 		assert.match(text, /window 1,000,000 tokens, cap 900,000/);
 		assert.match(text, /resolved: soft 100,000 \(10\.0%\), warning 200,000 \(20\.0%\), buffer 100,000, forced 300,000 \(30\.0%\)/);
 		assert.match(text, /prompts: soft .*USER_PROMPT_SOFT_SELF_COMPACT\.md \(\d+ chars\), warning .*USER_PROMPT_WARNING_SELF_COMPACT\.md \(\d+ chars\), compaction .*USER_PROMPT_COMPACTION_MESSAGE\.md \(\d+ chars\)/);
@@ -50,7 +50,7 @@ test("launch 2: 100k / 200k / 50k on a 1M model -> 10% / 20% / 25% markers", asy
 	});
 	try {
 		const { text, events } = await info(client);
-		assert.match(text, /--compact-soft-at 100k \(flag\), --compact-at 200k \(flag\), --compact-buffer 50k \(flag\)/);
+		assert.match(text, /noticeAt 100k \(flag\), warningAt 200k \(flag\), --compact-buffer 50k \(flag, warning \+ buffer\)/);
 		assert.match(text, /resolved: soft 100,000 \(10\.0%\), warning 200,000 \(20\.0%\), buffer 50,000, forced 250,000 \(25\.0%\)/);
 		assert.ok(text.includes("[-~-!|---------------]"), `bar markers moved to 10/20/25: ${text}`);
 		assert.equal(eventsOfType(events, "agent_start").length, 0);
