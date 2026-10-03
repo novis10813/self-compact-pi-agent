@@ -9,7 +9,7 @@
  * - Guidance reaches the model as a transient message on each LLM call while a phase is active
  *   (the `context` hook); it is never persisted into the model's context. Each threshold crossing shows the full
  *   guidance message once in the TUI. The transcript otherwise only shows the user's prompts and the returned note.
- * - `view_context()` returns used tokens, percent, level, and the thresholds as JSON, since the model cannot see the footer.
+ * - `view_context()` returns used tokens, percent, level, and the thresholds as JSON, since the model cannot see the TUI.
  * - At the forced threshold every tool except `self_compact` and `view_context` is blocked in `tool_call` with an
  *   explicit reason (the active tool list is never narrowed: Pi would answer "Tool X not found" before the hook).
  * - `self_compact({ note_to_self })` saves the note, ends the run, compaction runs once the agent is idle with the
@@ -18,7 +18,6 @@
  *   compact (the session fits inside keepRecentTokens) the tool refuses to save a new note and lock; with a note
  *   already saved and fresh usage below the warning line it returns the saved note as is and restores the tools.
  * - Failure or cancellation keeps the note and the lock; retries (transient failures only), /self-compact-now, reload and /tree recovery.
- * - One-line replacement footer: model id on the left, the 20-cell context bar and phase on the right.
  *
  * Merged from the claude-fable-5-1 and gpt-6-astra implementations (see specs/self-compact-merge.html).
  */
@@ -28,9 +27,9 @@ import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { compactionSettings, generateSummary, hasCompactionMaterial, keepRecentTokens } from "./summary.ts";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
-import { Text, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
-import { formatPct, formatTokens, renderContextBar } from "./context-bar.ts";
+import { formatPct, renderContextBar } from "./context-bar.ts";
 import {
 	FORCED_PROMPT,
 	BUILTIN_PROMPTS,
@@ -116,7 +115,6 @@ interface Runtime {
 	deliveryTimer?: ReturnType<typeof setTimeout>;
 	/** Deferred session-start work (resume nudge or pending-note compaction); cancelled on shutdown / tree switch. */
 	recoveryTimer?: ReturnType<typeof setTimeout>;
-	requestRender?: () => void;
 	alive: boolean;
 	idleRequestEpoch: number;
 	promptErrors: Set<string>;
@@ -144,13 +142,6 @@ function levelTag(level: UsageLevel): string {
 	if (level === "warning") return "WARNING";
 	if (level === "forced") return "FORCED";
 	return level === "idle" ? "" : "n/a";
-}
-
-/** One short word for the handoff in flight; the lock is implied, so no extra LOCKED suffix. */
-function handoffTag(status: Handoff["status"]): string {
-	if (status === "failed") return "COMPACTION FAILED";
-	if (status === "ready") return "COMPACTED";
-	return "COMPACTING";
 }
 
 export default function selfCompact(pi: ExtensionAPI) {
@@ -213,7 +204,7 @@ export default function selfCompact(pi: ExtensionAPI) {
 
 	// ---------------------------------------------------------------- helpers
 
-	/** Info toasts stay out of the TUI (the footer, phase lines, and handoff line already show them); warnings and errors show everywhere. */
+	/** Info toasts stay out of the TUI (the phase lines and handoff line already show them); warnings and errors show everywhere. */
 	function notify(ctx: ExtensionContext, message: string, type: "info" | "warning" | "error" = "info") {
 		if (!ctx.hasUI) return;
 		if (type === "info" && ctx.mode === "tui") return;
@@ -305,19 +296,9 @@ export default function selfCompact(pi: ExtensionAPI) {
 		return renderContextBar({ usedPct: u.percent, cachedPct, softPct: t.softPct, warnPct: t.warnPct, forcedPct: t.forcedPct }).text;
 	}
 
-	/** Footer tag: REJECTED > handoff in flight (COMPACTING / COMPACTED / COMPACTION FAILED) > phase (NOTICE / WARNING / FORCED). */
-	function statusTag(): string {
-		if (inert()) return "REJECTED";
-		const h = handoff();
-		if (h && h.status !== "done") return handoffTag(h.status);
-		return levelTag(R.level);
-	}
-
 	function refreshUi(ctx: ExtensionContext) {
 		R.usage = snapshotUsage(ctx);
 		R.level = R.thresholds ? levelFor(R.usage.tokens, R.thresholds) : "unknown";
-		if (ctx.mode === "tui") R.requestRender?.();
-		else if (ctx.hasUI) ctx.ui.setStatus("self-compact", [contextBarText(), statusTag()].filter(Boolean).join(" "));
 	}
 
 	/**
@@ -495,7 +476,7 @@ export default function selfCompact(pi: ExtensionAPI) {
 
 	// ----------------------------------------------------------------- tools
 
-	/** The agent's view of its own context: the same numbers as the footer, as plain JSON. */
+	/** The agent's view of its own context, as plain JSON. */
 	function contextView(ctx: ExtensionContext) {
 		R.usage = snapshotUsage(ctx);
 		R.level = R.thresholds ? levelFor(R.usage.tokens, R.thresholds) : "unknown";
@@ -691,48 +672,6 @@ export default function selfCompact(pi: ExtensionAPI) {
 		return new Text([theme.fg("accent", theme.bold(title ?? "self-compact info")), ...rest.map((l) => theme.fg("text", l))].join("\n"), 0, 0);
 	});
 
-	function installFooter(ctx: ExtensionContext) {
-		if (ctx.mode !== "tui") return;
-		ctx.ui.setFooter((tui, theme) => {
-			R.requestRender = () => tui.requestRender();
-			return {
-				dispose: () => {
-					R.requestRender = undefined;
-				},
-				invalidate() {},
-				render(width: number): string[] {
-					const t = R.thresholds;
-					const u = R.usage;
-					const level = R.level;
-					const bar = renderContextBar({
-						usedPct: t ? u.percent : null,
-						cachedPct: u.window > 0 ? (u.cachedTokens / u.window) * 100 : 0,
-						softPct: t?.softPct ?? 0,
-						warnPct: t?.warnPct ?? 0,
-						forcedPct: t?.forcedPct ?? 0,
-					});
-					const cells = bar.cells
-						.map((c) => {
-							if (c === "#") return theme.fg("success", c);
-							if (c === "=") return theme.fg("accent", c);
-							if (c === "~") return theme.fg("muted", c);
-							if (c === "!") return theme.fg("warning", c);
-							if (c === "|") return theme.fg("error", c);
-							return theme.fg("dim", c);
-						})
-						.join("");
-					const problem = inert();
-					const tag = statusTag();
-					const left = theme.fg("dim", ` ${ctx.model?.id ?? "no-model"}`) + (R.state.cycle > 0 ? theme.fg("dim", ` · cycle ${R.state.cycle}`) : "");
-					const phase = tag ? ` ${theme.fg(problem ? "error" : locked() ? "error" : levelColor(level), tag)}` : "";
-					const right = `${theme.fg("dim", "[")}${cells}${theme.fg("dim", `] ${bar.label}`)}${phase} `;
-					const pad = " ".repeat(Math.max(1, width - visibleWidth(left) - visibleWidth(right)));
-					return [truncateToWidth(left + pad + right, width)];
-				},
-			};
-		});
-	}
-
 	// ---------------------------------------------------------------- events
 
 	const recover = async (event: { reason?: string }, ctx: ExtensionContext) => {
@@ -789,7 +728,6 @@ export default function selfCompact(pi: ExtensionAPI) {
 				if (current && (current.status === "pending" || current.status === "failed") && ctx.isIdle()) startCompaction(ctx, `recovery after ${event.reason}`);
 			});
 		}
-		installFooter(ctx);
 		trackLevel(ctx);
 	};
 

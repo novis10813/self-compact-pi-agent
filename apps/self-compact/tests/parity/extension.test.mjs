@@ -37,8 +37,8 @@ async function host(t, flags = {}, settings = { compaction: { keepRecentTokens: 
   assert.deepEqual(loaded.errors, []);
   const extension = loaded.extensions[0];
   const entries = seedEntries(), messages = [], notices = [], compactions = [], requests = [];
+  const footerCalls = [], statusCalls = [];
   let tokens = 0;
-  let footer;
   let lastEntryId = entries[entries.length - 1].id;
   for (const [key, value] of Object.entries({ 'compact-soft-at': '20%', 'compact-at': '50%', 'compact-buffer': '10%', ...flags })) loaded.runtime.flagValues.set(key, value);
   // Appended entries join the session tree (real Pi chains every entry off the leaf), so the raw
@@ -56,7 +56,7 @@ async function host(t, flags = {}, settings = { compaction: { keepRecentTokens: 
     getContextUsage: () => ({ tokens, contextWindow: ctx.model.contextWindow, percent: tokens === null ? null : tokens / ctx.model.contextWindow * 100 }),
     isIdle: () => true,
     compact: options => compactions.push(options),
-    ui: { notify: (message, type) => notices.push({ message, type }), setFooter: factory => { footer = factory; }, setStatus() {} },
+    ui: { notify: (message, type) => notices.push({ message, type }), setFooter: (...args) => footerCalls.push(args), setStatus: (...args) => statusCalls.push(args) },
     modelRegistry: { complete: async (_model, request, options) => {
       requests.push({ request, options });
       return { role: 'assistant', api: 'openai-completions', provider: 'fake', model: 'parity-model', timestamp: 1, stopReason: 'stop', content: [{ type: 'text', text: 'Verified summary.' }], usage: { input: 10, output: 10, totalTokens: 20, cacheRead: 0, cacheWrite: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } };
@@ -85,7 +85,7 @@ async function host(t, flags = {}, settings = { compaction: { keepRecentTokens: 
     execute: (note = 'NEXT ACTION: continue', signal) => extension.tools.get('self_compact').definition.execute('call', { note_to_self: note }, signal, undefined, ctx),
     view: () => extension.tools.get('view_context').definition.execute('view', {}, undefined, undefined, ctx),
     info: () => extension.commands.get('self-compact-info').handler('', ctx),
-    footer: () => footer({ requestRender() {} }, { fg: (_color, text) => text, bold: text => text }).render(100)[0],
+    footerCalls, statusCalls,
   };
 }
 
@@ -180,13 +180,24 @@ test('P1: aborted self_compact never saves a note', async t => {
   assert.equal(h.entries.filter(entry => entry.customType === 'self-compact-state').length, 0);
 });
 
-test('Footer keeps context percentage and useful phases without idle ok', async t => {
+test('extension installs no custom footer and never sets a status line', async t => {
   const h = await host(t);
-  assert.match(h.footer(), /\] 0%\s*$/);
-  assert.doesNotMatch(h.footer(), /\bok\b/);
-  h.usage(45000);
-  await h.emit('turn_end');
-  assert.match(h.footer(), /NOTICE/);
+  assert.equal(h.footerCalls.length, 0, 'no setFooter at initialization');
+  assert.equal(h.statusCalls.length, 0, 'no setStatus at initialization');
+  // TUI usage transitions: notice, warning, forced cutoff, and a model switch.
+  for (const tokens of [45000, 110000, 130000]) {
+    h.usage(tokens);
+    await h.emit('turn_end');
+  }
+  await h.emit('model_select');
+  assert.equal(h.footerCalls.length, 0, 'no setFooter across TUI usage transitions');
+  assert.equal(h.statusCalls.length, 0, 'no setStatus across TUI usage transitions');
+  // Non-TUI hosts must not receive the old status-line fallback either.
+  h.ctx.mode = 'rpc';
+  await h.emit('model_select');
+  await h.emit('session_switch', { reason: 'switch' });
+  assert.equal(h.footerCalls.length, 0, 'no setFooter in RPC mode');
+  assert.equal(h.statusCalls.length, 0, 'no setStatus in RPC mode');
 });
 
 test('P2: native engine preserves split turns, previous summaries, budgets and file metadata', async t => {
