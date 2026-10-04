@@ -32,10 +32,13 @@ import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { formatPct, renderContextBar } from "./context-bar.ts";
 import {
+	COMPACTING_PROMPT,
+	FAILED_PROMPT,
 	FORCED_PROMPT,
 	BUILTIN_PROMPTS,
 	loadPromptFile,
 	NOTE_MAX_CHARS,
+	PENDING_PROMPT,
 	promptSearchDirs,
 	renderTemplate,
 	resolveCompactionPrompt,
@@ -124,7 +127,7 @@ interface Runtime {
 function nowPrompt(saved?: string): string {
 	const base = `Compact now: write your note_to_self (max ${NOTE_MAX_CHARS} chars: goal, DONE with exact paths and commands, IN PROGRESS, key decisions, verified test results, exact NEXT ACTION last) and call ${TOOL_NAME} as your only tool call.`;
 	if (!saved) return base;
-	return `${base}\n\nA note is already saved from a previous attempt. Pass it to ${TOOL_NAME} verbatim instead of inventing a new one. Saved note, verbatim:\n\n${saved}\n\n---\nCall ${TOOL_NAME} now with exactly that note.`;
+	return `${base}\n\nA note is already saved from a previous attempt. Pass it to ${TOOL_NAME} again, or an updated version if your plan changed (an updated note replaces the saved one). Saved note, verbatim:\n\n${saved}\n\n---\nCall ${TOOL_NAME} now with that note.`;
 }
 
 function guidanceMessage(text: string) {
@@ -351,7 +354,14 @@ export default function selfCompact(pi: ExtensionAPI) {
 
 	/** One transient guidance message is rebuilt from current usage for every LLM call. */
 	function guidanceText(ctx: ExtensionContext): string | undefined {
-		if (inert() || !R.thresholds || activeHandoff()) return undefined;
+		if (inert() || !R.thresholds) return undefined;
+		// A saved note with the run still going (messages arrived after self_compact): tell the model how to end it.
+		const h = activeHandoff();
+		if (h?.status === "pending") return renderTemplate(PENDING_PROMPT, templateValues());
+		if (h?.status === "failed") return renderTemplate(FAILED_PROMPT, { ...templateValues(), error: h.error ?? "unknown error" });
+		// Another extension's triggerTurn message can start a run while compaction is running (Pi only guards prompt()).
+		if (h?.status === "compacting") return COMPACTING_PROMPT;
+		if (h) return undefined;
 		const level = locked() ? "forced" : R.level;
 		if (level === "unknown" || level === "idle") return undefined;
 		if (!compactable(ctx)) return undefined;
@@ -563,7 +573,14 @@ export default function selfCompact(pi: ExtensionAPI) {
 			if (raw.trim().length === 0) throw new Error("note_to_self must not be blank. Write the goal, DONE work, IN PROGRESS state, decisions, test results, and the NEXT ACTION.");
 			if (raw.length > NOTE_MAX_CHARS) throw new Error(`note_to_self exceeds ${NOTE_MAX_CHARS} characters (${raw.length}). Shorten it and call ${TOOL_NAME} again.`);
 			const existing = activeHandoff();
-			if (existing && (existing.status === "compacting" || existing.status === "ready")) throw new Error("Compaction is already in progress for the saved note.");
+			if (existing && (existing.status === "compacting" || existing.status === "ready")) {
+				// Not an error: the handoff is already under way, and a thrown error would not end the run.
+				return {
+					content: [{ type: "text", text: `Compaction is already ${existing.status === "ready" ? "done" : "in progress"} for the saved note (${existing.note.length} chars); this call changed nothing. End your turn now: your note is returned to you when the run ends.` }],
+					details: { handoffId: existing.id, noteChars: existing.note.length, inProgress: true },
+					terminate: true,
+				};
+			}
 			if (!compactable(ctx)) {
 				R.usage = snapshotUsage(ctx);
 				const keep = keepRecentTokens(ctx.cwd, ctx.model);
@@ -584,11 +601,10 @@ export default function selfCompact(pi: ExtensionAPI) {
 				}
 				throw new Error(`Nothing to compact yet: Pi keeps the newest ${keep.toLocaleString("en-US")} tokens of messages untouched and this session does not reach past them (context ${R.usage.tokens?.toLocaleString("en-US") ?? "?"} tokens, ${formatPct(R.usage.percent, 1)}). No note was saved and no tool is blocked. Keep working and call ${TOOL_NAME} later.`);
 			}
-			if (existing && existing.note.trim() !== raw.trim()) {
-				throw new Error(`A note is already saved (${existing.note.length} chars). Retry ${TOOL_NAME} with that saved note verbatim instead of a new one.`);
-			}
-			// A retry keeps the original bytes; a new cycle gets a fresh durable id.
-			const note = existing ? existing.note : raw;
+			// A saved note that has not compacted yet is replaced by a different one (the context is still intact, so the
+			// new note is at least as informed); a retry with the same text keeps the original bytes and the durable id.
+			const replaced = existing !== undefined && existing.note.trim() !== raw.trim();
+			const note = existing && !replaced ? existing.note : raw;
 			R.state.handoff = { id: existing?.id ?? randomUUID(), note, status: "pending", attempts: 0, savedAt: Date.now() };
 			R.lastCompactionError = undefined;
 			setLocked(true);
@@ -597,7 +613,7 @@ export default function selfCompact(pi: ExtensionAPI) {
 			notify(ctx, `self-compact: note saved (${note.length} chars). Compaction runs when this turn ends.`, "info");
 			const at = R.usage.tokens === null ? "unknown usage" : `${R.usage.tokens.toLocaleString("en-US")} tokens (${formatPct(R.usage.percent, 1)}), level ${R.level}`;
 			return {
-				content: [{ type: "text", text: `Note saved (${note.length} chars) at ${at}. Every other tool is blocked until compaction succeeds. Stop now: compaction runs when this turn ends and your note will be returned verbatim.` }],
+				content: [{ type: "text", text: `${replaced ? "Saved note replaced" : "Note saved"} (${note.length} chars) at ${at}. Every other tool is blocked until compaction succeeds. Stop now: compaction runs when this turn ends and your note will be returned verbatim.` }],
 				details: { handoffId: R.state.handoff.id, noteChars: note.length, cycle: R.state.cycle + 1, note, usedTokens: R.usage.tokens, usedPercent: R.usage.percent, level: R.level },
 				terminate: true,
 			};
@@ -609,13 +625,13 @@ export default function selfCompact(pi: ExtensionAPI) {
 		renderResult(result, { expanded }, theme) {
 			const first = result.content[0];
 			const text = first && first.type === "text" ? first.text : "";
-			const details = result.details as { noteChars?: number; cycle?: number; note?: string; usedTokens?: number | null; usedPercent?: number | null; level?: string; selfHealed?: boolean } | undefined;
+			const details = result.details as { noteChars?: number; cycle?: number; note?: string; usedTokens?: number | null; usedPercent?: number | null; level?: string; selfHealed?: boolean; inProgress?: boolean } | undefined;
 			// Build the line from details (the text contains "21.1%", so splitting on "." would cut it short).
 			const usage = details?.usedTokens !== undefined && details?.usedTokens !== null ? ` at ${details.usedTokens.toLocaleString("en-US")} tokens (${formatPct(details.usedPercent, 1)})` : "";
 			const selfHealed = details?.selfHealed === true;
 			const line = selfHealed
 				? `Nothing to compact — saved note returned as-is${usage}. Every tool is restored.`
-				: details?.noteChars !== undefined ? `Note saved (${details.noteChars.toLocaleString("en-US")} chars)${usage}. Compaction runs when this turn ends.` : text;
+				: details?.noteChars !== undefined && !details.inProgress ? `Note saved (${details.noteChars.toLocaleString("en-US")} chars)${usage}. Compaction runs when this turn ends.` : text;
 			let out = theme.fg(selfHealed ? "warning" : "success", `${selfHealed ? "↻" : "✓"} ${line}`);
 			if (expanded && details?.note) out += `\n${theme.fg("dim", details.note)}`;
 			return new Text(out, 0, 0);
@@ -818,16 +834,34 @@ export default function selfCompact(pi: ExtensionAPI) {
 		}
 		if (locked()) {
 			const h = handoff();
+			if (h?.status === "pending") {
+				// The run went on after self_compact (queued user, background, or subagent messages). Terminating the
+				// blocked batch skips the next LLM call, so the run can end and the idle compaction can start.
+				return {
+					block: true,
+					terminate: true,
+					reason: `Tool "${event.toolName}" is blocked by self-compact: your ${TOOL_NAME} note is saved and compaction starts as soon as this run ends. End your turn now with a one-line reply and no tool calls, or call ${TOOL_NAME} with an updated note to replace the saved one.`,
+				};
+			}
+			if (h?.status === "compacting") {
+				// A run started alongside the compaction: end it so the handoff can be delivered once Pi is idle.
+				return {
+					block: true,
+					terminate: true,
+					reason: `Tool "${event.toolName}" is blocked by self-compact: compaction of your saved note is running now. End your turn now with a one-line reply and no tool calls; your note is returned to you when compaction finishes.`,
+				};
+			}
 			const u = R.usage;
 			const t = R.thresholds;
-			const why = h && (h.status === "pending" || h.status === "compacting")
-				? `a ${TOOL_NAME} note is saved and compaction is ${h.status}`
-				: h && h.status === "failed"
-					? `the last compaction failed (${h.error ?? "unknown error"}) and the saved note is kept`
-					: `context is at ${formatPct(u.percent, 1)} (${u.tokens?.toLocaleString("en-US") ?? "?"} tokens), at or above the forced threshold of ${formatPct(t?.forcedPct ?? null, 1)} (${t?.forcedTokens.toLocaleString("en-US") ?? "?"} tokens)`;
+			const why = h && h.status === "failed"
+				? `the last compaction failed (${h.error ?? "unknown error"}) and the saved note is kept`
+				: `context is at ${formatPct(u.percent, 1)} (${u.tokens?.toLocaleString("en-US") ?? "?"} tokens), at or above the forced threshold of ${formatPct(t?.forcedPct ?? null, 1)} (${t?.forcedTokens.toLocaleString("en-US") ?? "?"} tokens)`;
+			const next = h && h.status === "failed"
+				? `Call ${TOOL_NAME} now to retry, with the saved note or an updated one (an updated note replaces the saved one).`
+				: `Write your note_to_self and call ${TOOL_NAME} now.`;
 			return {
 				block: true,
-				reason: `Tool "${event.toolName}" is blocked by self-compact: ${why}. Every tool except ${TOOL_NAME} is blocked until compaction succeeds. Write your note_to_self and call ${TOOL_NAME} now.`,
+				reason: `Tool "${event.toolName}" is blocked by self-compact: ${why}. Every tool except ${TOOL_NAME} is blocked until compaction succeeds. ${next}`,
 			};
 		}
 		return undefined;

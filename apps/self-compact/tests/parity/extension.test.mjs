@@ -889,6 +889,77 @@ test('P8: pending note with no material: explicit tool retry self-heals', async 
   assert.equal(h.messages.length, 1, 'no duplicate delivery');
 });
 
+test('P9: messages after a saved note: blocked tools end the run, guidance explains the way out', async t => {
+  const h = await host(t);
+  h.usage(110000);
+  await h.execute('NEXT ACTION: original');
+  const saved = lastState(h).handoff;
+  assert.equal(saved.status, 'pending');
+  // A queued message started another turn: the model sees PENDING guidance, and a blocked tool terminates the batch.
+  const context = await h.emit('context', { messages: [{ role: 'user', content: 'background task finished', timestamp: 1 }] });
+  assert.equal(context.messages.length, 2);
+  assert.match(context.messages[1].content, /^\[self-compact · PENDING\]/);
+  const blocked = await h.emit('tool_call', { toolName: 'bash', toolCallId: 'x' });
+  assert.equal(blocked.block, true);
+  assert.equal(blocked.terminate, true);
+  assert.match(blocked.reason, /compaction starts as soon as this run ends/);
+  // An updated note replaces the saved one under the same durable id and still ends the run.
+  const result = await h.execute('NEXT ACTION: updated after the background task');
+  assert.equal(result.terminate, true);
+  assert.match(result.content[0].text, /^Saved note replaced/);
+  const replaced = lastState(h).handoff;
+  assert.equal(replaced.id, saved.id);
+  assert.equal(replaced.note, 'NEXT ACTION: updated after the background task');
+  assert.equal(replaced.status, 'pending');
+  await h.emit('agent_settled');
+  assert.equal(h.compactions.length, 1, 'idle compaction starts');
+});
+
+test('P9: failed handoff: FAILED guidance, blocked tools do not terminate, an updated note replaces the saved one', async t => {
+  const h = await host(t);
+  h.usage(110000);
+  await h.execute('NEXT ACTION: original');
+  await h.emit('agent_settled');
+  h.ctx.modelRegistry.complete = async () => { throw new Error('transient provider hiccup'); };
+  assert.deepEqual(await h.emit('session_before_compact', summaryEvent()), { cancel: true });
+  await h.emit('session_compact_failed', { reason: 'manual', aborted: true });
+  const failed = lastState(h).handoff;
+  assert.equal(failed.status, 'failed');
+  const context = await h.emit('context', { messages: [] });
+  assert.match(context.messages[0].content, /^\[self-compact · FAILED\] The last compaction failed \(Summary generation failed/);
+  const blocked = await h.emit('tool_call', { toolName: 'bash', toolCallId: 'x' });
+  assert.equal(blocked.block, true);
+  assert.equal(blocked.terminate, undefined, 'the model must be able to call self_compact in this run');
+  assert.match(blocked.reason, /Call self_compact now to retry/);
+  const result = await h.execute('NEXT ACTION: updated');
+  assert.equal(result.terminate, true);
+  const replaced = lastState(h).handoff;
+  assert.equal(replaced.id, failed.id);
+  assert.equal(replaced.note, 'NEXT ACTION: updated');
+  assert.equal(replaced.status, 'pending');
+});
+
+test('P9: a run started during compaction: COMPACTING guidance, blocked tools and self_compact end the run', async t => {
+  const h = await host(t);
+  h.usage(110000);
+  await h.execute('NEXT ACTION: original');
+  await h.emit('agent_settled');
+  assert.equal(h.compactions.length, 1);
+  assert.equal(lastState(h).handoff.status, 'compacting');
+  // A background or subagent message with triggerTurn started a run while compaction is running.
+  const context = await h.emit('context', { messages: [{ role: 'user', content: 'subagent finished', timestamp: 1 }] });
+  assert.match(context.messages[1].content, /^\[self-compact · COMPACTING\]/);
+  const blocked = await h.emit('tool_call', { toolName: 'bash', toolCallId: 'x' });
+  assert.equal(blocked.block, true);
+  assert.equal(blocked.terminate, true);
+  assert.match(blocked.reason, /compaction of your saved note is running now/);
+  const result = await h.execute('NEXT ACTION: something new');
+  assert.equal(result.terminate, true, 'no thrown error: the call ends the run');
+  assert.match(result.content[0].text, /already in progress.*changed nothing/);
+  assert.equal(lastState(h).handoff.note, 'NEXT ACTION: original', 'the note being compacted is untouched');
+  assert.equal(h.compactions.length, 1, 'no second compaction');
+});
+
 const configView = async h => JSON.parse((await h.view()).content[0].text);
 const thresholdTokens = view => Object.values(view.thresholds).map(value => value.tokens);
 const settingsHost = (t, config, flags = {}, projectSettings, extra = {}) => host(t, flags, projectSettings, undefined, { useDefaultFlags: false, globalSettings: { selfCompact: config }, ...extra });

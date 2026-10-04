@@ -157,3 +157,40 @@ test("failed compaction keeps the note and the lock; /self-compact-now reuses th
 		await fourth.close();
 	}
 });
+
+test("a message queued after self_compact keeps the run going: the blocked reaction ends the run and the handoff still completes", async () => {
+	const t = makeTestDir("queued-after-handoff");
+	const client = new RpcClient({
+		args: scriptedArgs(t, PERCENT_FLAGS),
+		cwd: t.dir,
+		env: { ...DEFAULT_FAKE_ENV, SC_FAKE_SCENARIO: "ignore-until-forced", SC_FAKE_TRACE: t.traceFile, SC_FAKE_INJECT: "Background task finished: inspect its output." },
+		logFile: t.logFile,
+	});
+	try {
+		await client.request({ type: "prompt", message: "Start the scripted work." });
+		const saved = await client.waitFor((e) => e.type === "tool_execution_end" && e.toolName === "self_compact" && e.isError === false, 90_000);
+		const after = client.events.indexOf(saved);
+
+		// The queued message started another turn; the model reacted with a tool call, which was blocked with terminate.
+		const blocked = await client.waitFor((e) => e.type === "tool_execution_end" && e.toolName === "bash" && e.isError === true, 30_000, { since: after });
+		assert.match(messageText(blocked.result), /compaction starts as soon as this run ends/);
+		const turns = readFileSync(t.traceFile, "utf8").trim().split("\n").map((line) => JSON.parse(line) as { kind: string; lastText?: string });
+		assert.ok(turns.some((r) => r.kind === "turn" && /^\[self-compact · PENDING\]/.test(r.lastText ?? "")), "model saw the PENDING guidance");
+
+		// No further LLM call in that run: the next thing after the blocked batch is the idle compaction.
+		const compactionEnd = await client.waitFor((e) => e.type === "compaction_end", 60_000, { since: after });
+		assert.equal(compactionEnd.aborted, false);
+		const blockedAt = client.events.indexOf(blocked);
+		const compactionStartAt = client.events.findIndex((e, i) => i > blockedAt && e.type === "compaction_start");
+		const assistantsBetween = client.events.slice(blockedAt, compactionStartAt).filter((e) => e.type === "message_end" && (e.message as { role?: string }).role === "assistant");
+		assert.equal(assistantsBetween.length, 0, "the blocked batch ended the run");
+
+		const handoff = await client.waitFor((e) => e.type === "message_end" && (e.message as { customType?: string })?.customType === "self-compact-handoff", 60_000, { since: after });
+		await client.waitFor((e) => e.type === "tool_execution_end" && e.toolName === "write" && e.isError === false, 60_000, { since: client.events.indexOf(handoff) });
+		await client.waitFor((e) => e.type === "agent_settled", 60_000, { since: client.events.indexOf(handoff) });
+		assert.equal(eventsOfType(client.events, "message_end").filter((e) => (e.message as { customType?: string })?.customType === "self-compact-handoff").length, 1, "handoff delivered once");
+		assert.equal(readFileSync(join(t.dir, "result.txt"), "utf8").trim(), "done");
+	} finally {
+		await client.close();
+	}
+});

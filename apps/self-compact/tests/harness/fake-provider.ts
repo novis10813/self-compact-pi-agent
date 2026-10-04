@@ -18,6 +18,9 @@
  *   SC_FAKE_MAX_STEPS     stop with "Task complete." after this many bash steps (0 = unbounded)
  *   SC_FAKE_SIBLING       "before" | "after": when handing off, also emit a bash call before/after self_compact in the same batch
  *   SC_FAKE_CYCLES        number of handoffs to complete before writing the result (default 1)
+ *   SC_FAKE_INJECT        message queued as steering right after the first successful self_compact, modeling a
+ *                         user, background-task, or subagent message that keeps the run going (unset = none)
+ *   SC_FAKE_OVERFLOW      "1": a turn whose context would exceed SC_FAKE_WINDOW fails with a provider overflow error
  */
 import { appendFileSync } from "node:fs";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -49,6 +52,7 @@ let lastSentNote = "";
 const MAX_STEPS = Number(env("SC_FAKE_MAX_STEPS", "0"));
 const SIBLING = env("SC_FAKE_SIBLING", "");
 const CYCLES = Number(env("SC_FAKE_CYCLES", "1"));
+const OVERFLOW = env("SC_FAKE_OVERFLOW", "") === "1";
 let handoffsSeen = 0;
 
 function noteForMode(): string {
@@ -109,7 +113,7 @@ function decide(context: Context): Plan {
 	// Transient guidance arrives as a trailing user-role message; look past it for the real last message.
 	let lastIndex = messages.length - 1;
 	let guidance = "";
-	if (lastIndex >= 0 && messages[lastIndex]!.role === "user" && /^\[self-compact · (notice|WARNING|FORCED)\]/.test(textOf((messages[lastIndex] as { content?: unknown }).content))) {
+	if (lastIndex >= 0 && messages[lastIndex]!.role === "user" && /^\[self-compact · (notice|WARNING|FORCED|PENDING|FAILED)\]/.test(textOf((messages[lastIndex] as { content?: unknown }).content))) {
 		guidance = textOf((messages[lastIndex] as { content?: unknown }).content);
 		lastIndex -= 1;
 	}
@@ -211,17 +215,21 @@ function streamScripted(model: Model<any>, context: Context, options?: SimpleStr
 		stopReason: "pending",
 		timestamp: Date.now(),
 	};
-	const isSummary = !context.tools || context.tools.length === 0;
+	// Pi 1.0 declares the tool loadout in the leading system message ("<tools>" section) instead of context.tools;
+	// a summary request carries neither.
+	const systemMessage = context.messages.find((m) => (m as { role: string }).role === "system") as { content?: unknown; sections?: Record<string, unknown> } | undefined;
+	const systemPrompt = context.systemPrompt ?? (textOf(systemMessage?.content) || Object.values(systemMessage?.sections ?? {}).filter((v) => typeof v === "string").join("\n\n"));
+	const isSummary = !(context.tools && context.tools.length > 0) && !systemPrompt.includes("<tools>");
 	setTimeout(() => {
 		try {
 			stream.push({ type: "start", partial: output });
 			if (isSummary) {
 				summaryCalls += 1;
-				trace({ kind: "summary", call: summaryCalls, systemPrompt: context.systemPrompt?.slice(0, 200) });
+				trace({ kind: "summary", call: summaryCalls, systemPrompt: systemPrompt.slice(0, 200) });
 				if (summaryCalls <= SUMMARY_FAIL) {
 					throw new Error(`fake summary failure #${summaryCalls}`);
 				}
-				const text = `FAKE-SUMMARY[${(context.systemPrompt ?? "").slice(0, 60)}]\n## Goal\nScripted goal.\n## Next Steps\n1. Follow the note.`;
+				const text = `FAKE-SUMMARY[${systemPrompt.slice(0, 60)}]\n## Goal\nScripted goal.\n## Next Steps\n1. Follow the note.`;
 				output.content.push({ type: "text", text: "" });
 				stream.push({ type: "text_start", contentIndex: 0, partial: output });
 				(output.content[0] as { text: string }).text = text;
@@ -233,6 +241,10 @@ function streamScripted(model: Model<any>, context: Context, options?: SimpleStr
 				output.stopReason = "stop";
 			} else {
 				const plan = decide(context);
+				if (OVERFLOW && plan.usageTotal > WINDOW) {
+					trace({ kind: "overflow", usageTotal: plan.usageTotal });
+					throw new Error(`prompt is too long: ${plan.usageTotal} tokens > ${WINDOW} maximum`);
+				}
 				const lastMessage = context.messages[context.messages.length - 1];
 				trace({ kind: "turn", plan, lastRole: lastMessage?.role, lastText: lastMessage ? textOf((lastMessage as { content?: unknown }).content).slice(0, 400) : "", messages: context.messages.length });
 				let index = 0;
@@ -276,6 +288,15 @@ function streamScripted(model: Model<any>, context: Context, options?: SimpleStr
 }
 
 export default function fakeProvider(pi: ExtensionAPI) {
+	const inject = process.env.SC_FAKE_INJECT;
+	let injected = false;
+	if (inject) {
+		pi.on("tool_result", async (event) => {
+			if (injected || event.toolName !== "self_compact" || event.isError) return;
+			injected = true;
+			pi.sendUserMessage(inject, { deliverAs: "steer" });
+		});
+	}
 	pi.registerProvider("fake", {
 		name: "Fake scripted provider",
 		baseUrl: "http://127.0.0.1:1/fake",

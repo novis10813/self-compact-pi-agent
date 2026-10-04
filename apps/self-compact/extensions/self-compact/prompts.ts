@@ -39,6 +39,7 @@ export const TEMPLATE_KEYS = [
 	"remaining_to_forced",
 	"cycle",
 	"note_max_chars",
+	"error",
 ] as const;
 
 export type TemplateValues = Partial<Record<(typeof TEMPLATE_KEYS)[number], string | number>>;
@@ -63,6 +64,15 @@ Rules: never invent completed work; preserve exact file paths, commands, and err
 };
 
 export const FORCED_PROMPT = `[self-compact · FORCED] Context usage is {{used_tokens}} tokens ({{used_percent}}), at the hard cutoff of {{forced_tokens}} ({{forced_percent}}). Every tool except \`self_compact\` is blocked until compaction succeeds. Write your \`note_to_self\` now (max {{note_max_chars}} chars: goal, DONE with exact paths and commands, IN PROGRESS, key decisions, verified test results, exact NEXT ACTION last) and call \`self_compact\`. Do not call any other tool.`;
+
+/** A note is saved and compaction waits for the run to end, but new messages kept the run going. */
+export const PENDING_PROMPT = `[self-compact · PENDING] Your \`note_to_self\` is saved and compaction starts as soon as this run ends. Every tool except \`self_compact\` is blocked. Do not act on messages that arrived after you saved the note. If one changes your plan, call \`self_compact\` with an updated note (it replaces the saved one). Otherwise reply with one short line and no tool calls to end your turn.`;
+
+/** Compaction of the saved note is running, but a message started a run alongside it. */
+export const COMPACTING_PROMPT = `[self-compact · COMPACTING] Compaction of your saved \`note_to_self\` is running now. Every tool is blocked until it finishes, and \`self_compact\` has nothing left to do. Do not act on new messages yet. Reply with one short line and no tool calls to end your turn; your note is returned to you when compaction finishes.`;
+
+/** A note is saved but the last compaction attempt failed. */
+export const FAILED_PROMPT = `[self-compact · FAILED] The last compaction failed ({{error}}). Your \`note_to_self\` is kept and every tool except \`self_compact\` is blocked. Call \`self_compact\` to retry, with the saved note or an updated one (an updated note replaces the saved one).`;
 
 export function promptSearchDirs(cwd: string, extensionDir: string): string[] {
 	const dirs = [resolve(cwd, PROMPT_SUBDIR), resolve(extensionDir, "..", "..", PROMPT_SUBDIR)];
