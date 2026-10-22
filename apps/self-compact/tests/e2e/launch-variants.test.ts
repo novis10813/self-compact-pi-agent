@@ -4,6 +4,7 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import { RpcClient, eventsOfType, messageText, type RpcEvent } from "../harness/rpc-client.ts";
 import { DEFAULT_FAKE_ENV, makeTestDir, scriptedArgs } from "../harness/env.ts";
 
@@ -20,9 +21,9 @@ async function info(client: RpcClient): Promise<{ text: string; events: RpcEvent
 test("launch 1: defaults on a 1M model resolve to 100k / 200k / 300k (10% / 20% / 30%); info starts no LLM turn", async () => {
 	const t = makeTestDir("launch-defaults");
 	const client = new RpcClient({
-		args: scriptedArgs(t, ["--model", "anthropic/claude-sonnet-4-5"]),
+		args: scriptedArgs(t),
 		cwd: t.dir,
-		env: DEFAULT_FAKE_ENV,
+		env: { ...DEFAULT_FAKE_ENV, SC_FAKE_WINDOW: "1000000" },
 		logFile: t.logFile,
 	});
 	try {
@@ -30,7 +31,7 @@ test("launch 1: defaults on a 1M model resolve to 100k / 200k / 300k (10% / 20% 
 		assert.match(text, /noticeAt 10% \(default\), warningAt 20% \(default\), --compact-buffer 10% \(default, warning \+ buffer\), --compact-prompt unset/);
 		assert.match(text, /window 1,000,000 tokens, cap 900,000/);
 		assert.match(text, /resolved: soft 100,000 \(10\.0%\), warning 200,000 \(20\.0%\), buffer 100,000, forced 300,000 \(30\.0%\)/);
-		assert.match(text, /prompts: soft .*USER_PROMPT_SOFT_SELF_COMPACT\.md \(\d+ chars\), warning .*USER_PROMPT_WARNING_SELF_COMPACT\.md \(\d+ chars\), compaction .*USER_PROMPT_COMPACTION_MESSAGE\.md \(\d+ chars\)/);
+		assert.match(text, /prompts: soft .*USER_PROMPT_SOFT_SELF_COMPACT\.md \(\d+ chars\), warning .*USER_PROMPT_WARNING_SELF_COMPACT\.md \(\d+ chars\), compaction additional instructions .*USER_PROMPT_COMPACTION_MESSAGE\.md \(\d+ chars\)/);
 		assert.match(text, /state: level (idle|unknown), tools unlocked, handoff none, attempts 0/);
 		assert.match(text, /cycles completed: 0/);
 		assert.equal(eventsOfType(events, "agent_start").length, 0, "no LLM turn for /self-compact-info");
@@ -43,9 +44,9 @@ test("launch 1: defaults on a 1M model resolve to 100k / 200k / 300k (10% / 20% 
 test("launch 2: 100k / 200k / 50k on a 1M model -> 10% / 20% / 25% markers", async () => {
 	const t = makeTestDir("launch-tokens");
 	const client = new RpcClient({
-		args: scriptedArgs(t, ["--model", "anthropic/claude-sonnet-4-5", "--compact-soft-at", "100k", "--compact-at", "200k", "--compact-buffer", "50k"]),
+		args: scriptedArgs(t, ["--compact-soft-at", "100k", "--compact-at", "200k", "--compact-buffer", "50k"]),
 		cwd: t.dir,
-		env: DEFAULT_FAKE_ENV,
+		env: { ...DEFAULT_FAKE_ENV, SC_FAKE_WINDOW: "1000000" },
 		logFile: t.logFile,
 	});
 	try {
@@ -59,12 +60,12 @@ test("launch 2: 100k / 200k / 50k on a 1M model -> 10% / 20% / 25% markers", asy
 	}
 });
 
-test("launch 3: 20% / 50% / 0 with --compact-prompt: zero buffer, literal summary prompt, note-free /compact", async () => {
+test("launch 3: 20% / 50% / 0 with --compact-prompt: zero buffer, literal additional instructions, native /compact", async () => {
 	const t = makeTestDir("launch-percent-prompt");
 	const client = new RpcClient({
 		args: scriptedArgs(t, ["--compact-soft-at", "20%", "--compact-at", "50%", "--compact-buffer", "0", "--compact-prompt", LITERAL_PROMPT]),
 		cwd: t.dir,
-		env: { ...DEFAULT_FAKE_ENV, SC_FAKE_SCENARIO: "never-compact", SC_FAKE_MAX_STEPS: "3", SC_FAKE_STEP: "5000", SC_FAKE_TRACE: t.traceFile },
+		env: { ...DEFAULT_FAKE_ENV, SC_FAKE_TRACE: t.traceFile },
 		logFile: t.logFile,
 	});
 	try {
@@ -72,20 +73,36 @@ test("launch 3: 20% / 50% / 0 with --compact-prompt: zero buffer, literal summar
 		assert.match(first.text, /--compact-prompt set \(\d+ chars\)/);
 		assert.match(first.text, /resolved: soft 40,000 \(20\.0%\), warning 100,000 \(50\.0%\), buffer 0, forced 100,000 \(50\.0%\)/);
 		assert.ok(first.text.includes("[---~-----|----------]"), `zero buffer shows a single | : ${first.text}`);
-		assert.match(first.text, /compaction flag \(\d+ chars\)/);
+		assert.match(first.text, /compaction additional instructions flag \(\d+ chars\)/);
 
-		// A short bounded conversation, then the built-in /compact escape hatch (RPC "compact" = /compact).
 		await client.request({ type: "prompt", message: "Start the scripted work." });
-		await client.waitFor((e) => e.type === "agent_settled", 60_000);
+		const handoff = await client.waitFor((e) => e.type === "message_end" && (e.message as { customType?: string })?.customType === "self-compact-handoff", 60_000);
+		await client.waitFor((e) => e.type === "agent_settled", 60_000, { since: client.events.indexOf(handoff) });
+		const summaries = () => readFileSync(t.traceFile, "utf8").trim().split("\n").map(line => JSON.parse(line) as { kind: string; systemPrompt?: string; userPrompt?: string }).filter(item => item.kind === "summary");
+		const selfSummaries = summaries();
+		assert.equal(selfSummaries.length, 1);
+		assert.match(selfSummaries[0]!.systemPrompt!, /^You are a context summarization assistant/);
+		assert.ok(selfSummaries[0]!.userPrompt!.includes(`Additional focus: ${LITERAL_PROMPT}`));
+
+		// Add enough fresh material for another native compaction.
+		const since = client.mark();
+		await client.request({ type: "prompt", message: "New history. ".repeat(1000) });
+		await client.waitFor(e => e.type === "agent_settled", 10000, { since });
+		// Built-in /compact keeps Pi's native prompt and ignores --compact-prompt.
 		const compact = await client.request({ type: "compact" }, 60_000);
 		assert.equal(compact.success, true, JSON.stringify(compact));
-		const data = compact.data as { summary?: string; details?: { selfCompact?: { promptSource?: string; noteChars?: number } } };
-		assert.ok((data.summary ?? "").includes(`FAKE-SUMMARY[${LITERAL_PROMPT.slice(0, 60)}]`), `literal --compact-prompt used as the summary system prompt: ${data.summary}`);
-		assert.equal(data.details?.selfCompact?.promptSource, "flag");
-		assert.equal(data.details?.selfCompact?.noteChars, 0, "manual /compact runs without a note");
-		assert.equal(eventsOfType(client.events, "message_end").filter((e) => (e.message as { details?: { kind?: string } })?.details?.kind === "handoff").length, 0, "no note to return after a note-free /compact");
+		const data = compact.data as { summary?: string; details?: Record<string, unknown> };
+		assert.match(data.summary ?? "", /FAKE-SUMMARY\[You are a context summarization assistant/);
+		assert.equal(data.details?.selfCompact, undefined);
+		const nativeSummaries = summaries().slice(selfSummaries.length);
+		assert.ok(nativeSummaries.length > 0);
+		for (const summary of nativeSummaries) {
+			assert.match(summary.systemPrompt!, /^You are a context summarization assistant/);
+			assert.doesNotMatch(summary.userPrompt!, /Additional focus:/);
+		}
+		assert.equal(eventsOfType(client.events, "message_end").filter((e) => (e.message as { customType?: string })?.customType === "self-compact-handoff").length, 1, "native /compact does not return the old note again");
 		const after = await info(client);
-		assert.match(after.text, /handoff none/);
+		assert.match(after.text, /handoff done/);
 	} finally {
 		await client.close();
 	}

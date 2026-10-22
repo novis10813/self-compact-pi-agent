@@ -103,9 +103,9 @@ test("lifecycle: thresholds, lock, self_compact, compaction, verbatim note, cont
 		assert.ok(eventsOfType(events, "agent_end").some((e) => events.indexOf(e) < events.indexOf(firstCompactionStart)), "run ended before compaction started");
 		const compactionEnd = eventsOfType(events, "compaction_end")[0]!;
 		assert.equal(compactionEnd.aborted, false);
-		const result = compactionEnd.result as { summary?: string; details?: { handoffId?: string; selfCompact?: { promptSource?: string } } };
-		assert.match(result.summary ?? "", /FAKE-SUMMARY\[You are the context-compaction summarizer/, "summary produced with our compaction prompt file");
-		assert.ok(result.details?.handoffId, "compaction carries the durable handoff id");
+		const result = compactionEnd.result as { summary?: string; details?: Record<string, unknown> };
+		assert.match(result.summary ?? "", /FAKE-SUMMARY\[You are a context summarization assistant/, "summary uses Pi's built-in prompt");
+		assert.equal(result.details?.handoffId, undefined, "Pi owns compaction metadata");
 
 		// 5. The note came back verbatim, once, and the agent continued without a user message.
 		const note = noteFromTrace(t.traceFile);

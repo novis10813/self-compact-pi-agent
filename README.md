@@ -110,12 +110,12 @@ Twenty cells at 5 % each. `#` cached, `=` not cached, `-` free. `~` soft, `!` wa
 self-compact/
 ├─ apps/self-compact/                    # the extension (the only app)
 │   ├─ extensions/self-compact/
-│   │   ├─ self-compact.ts               # entry: flags, tool, commands, events, footer, compaction override
+│   │   ├─ self-compact.ts               # entry: flags, tool, commands, events, footer, handoff
 │   │   ├─ defaults.ts                   # shipped thresholds: notice 10%, warning 20%, hard cutoff 30%
 │   │   ├─ thresholds.ts                 # tokens / k / m / % parsing, 90 % cap, level
 │   │   ├─ context-bar.ts                # 20-cell bar renderer
 │   │   ├─ prompts.ts                    # prompt lookup, templating, precedence
-│   │   ├─ summary.ts                    # native compaction call with the replacement summary prompt
+│   │   ├─ summary.ts                    # Pi compaction precheck and resolved settings
 │   │   └─ state.ts                      # state snapshot, durable handoff id, recovery
 │   ├─ .pi/self-compact/                 # three editable prompt files (live values via {{placeholders}})
 │   ├─ tests/                            # unit, harness (scripted provider + RPC client), e2e
@@ -142,7 +142,7 @@ just real                              # live run on openrouter/deepseek/deepsee
 just verify                            # every deterministic check; logs land in apps/self-compact/verification/ (gitignored)
 ```
 
-Inside Pi: `/self-compact-info` (settings, thresholds, usage, state, cycles, prompt sources, pending note) and `/self-compact-now` (asks the agent to write its note and call the tool, reusing a saved note on retry). Built-in `/compact` is untouched and uses the same summary override. The agent gets two tools: `self_compact(note_to_self)` and `view_context()`, which returns its usage, percent, and thresholds as JSON.
+Inside Pi: `/self-compact-info` (settings, thresholds, usage, state, cycles, prompt sources, pending note) and `/self-compact-now` (asks the agent to write its note and call the tool, reusing a saved note on retry). Built-in `/compact` is untouched and does not use self-compact’s additional instructions. Pi’s threshold and overflow auto compaction are allowed to run normally. A successful compaction returns any pending handoff note and unlocks tools. The agent gets two tools: `self_compact(note_to_self)` and `view_context()`, which returns its usage, percent, and thresholds as JSON.
 
 **Defaults and how to change them.** The shipped thresholds are one constants file: [`apps/self-compact/extensions/self-compact/defaults.ts`](apps/self-compact/extensions/self-compact/defaults.ts).
 
@@ -159,7 +159,7 @@ pi -e apps/self-compact/extensions/self-compact/self-compact.ts --compact-soft-a
 just soft=15% warn=40% buffer=5% run                            # same three flags through the justfile
 ```
 
-Flags accept whole tokens (`270000`), `k`/`m` (`100k`, `1.5m`), or percentages of the model window (`20%`). `--compact-buffer 0` blocks at the warning line. `--compact-prompt "..."` replaces the summary system prompt literally; otherwise `.pi/self-compact/USER_PROMPT_COMPACTION_MESSAGE.md` does.
+Flags accept whole tokens (`270000`), `k`/`m` (`100k`, `1.5m`), or percentages of the model window (`20%`). `--compact-buffer 0` blocks at the warning line. Pi generates summaries with its built-in prompt, or delegates generation to pi-compaction-model when installed. For compaction triggered by self-compact only, `--compact-prompt "..."` supplies additional instructions appended to Pi’s prompt through `customInstructions`. The fallback is `.pi/self-compact/USER_PROMPT_COMPACTION_MESSAGE.md`, then built-in extra rules. These rules do not apply to `/compact` or Pi auto compaction.
 
 ---
 
@@ -172,7 +172,7 @@ Flags accept whole tokens (`270000`), `k`/`m` (`100k`, `1.5m`), or percentages o
 The deterministic suite launches the real `pi --mode rpc` with a scripted provider whose reported usage grows every turn. That makes every crossing, the lock, sibling blocking, compaction, failure, `--session` recovery, and the exact note round-trip repeatable and free.
 
 ```bash
-just e2e                                        # lifecycle, sibling batches, note validation, failure/recovery, launch variants
+just e2e                                        # lifecycle, failure/recovery, launch variants, background messages, overflow
 just real                                       # live model: forced cutoff -> self_compact -> compaction -> note verbatim -> result.txt = done
 just verify                                     # every deterministic check; logs land in apps/self-compact/verification/ (gitignored)
 ```
@@ -186,7 +186,7 @@ What you should see at the end of a real run: a `result.txt` containing `done`, 
 - Usage is Pi's estimate. A single huge tool result can jump past a threshold before the lock engages; the next call is still blocked.
 - The lock stops new tool calls. Tools already running when the note is saved finish on their own.
 - A model can ignore the warning. That is why the forced phase exists: at the hard cutoff nothing but `self_compact` works.
-- Compaction quality is model quality. The summary prompt is yours to edit, and the note is never replaced by the summary.
+- Compaction quality is model quality. You can edit the additional summary instructions used by self-compact, and the note is never replaced by the summary.
 - Very small sessions have nothing to compact. Pi keeps the newest `keepRecentTokens` (20k by default) untouched, so `self_compact` refuses with that reason and the agent keeps working. Keep every threshold above that retained history.
 
 ---

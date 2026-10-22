@@ -11,6 +11,8 @@
  *   SC_FAKE_STEP          extra tokens per assistant message present in context (default 15000)
  *   SC_FAKE_SCENARIO      "ignore-until-forced" (default) | "obey-notice" | "obey-warning" | "obey-forced" | "never-compact"
  *   SC_FAKE_SUMMARY_FAIL  number of summary requests that fail before one succeeds (default 0)
+ *   SC_FAKE_SUMMARY_DELAY delay in ms before a summary response (default 5)
+ *   SC_FAKE_PARALLEL_DELAY delay in ms before a run started during compaction responds (default 5)
  *   SC_FAKE_NOTE          note_to_self text used when the script calls self_compact
  *   SC_FAKE_NOTE_MODE     "normal" (default) | "blank" | "toolong" | "maxlen" | "whitespace"
  *   SC_FAKE_RESULT_PATH   file the script writes after the handoff (default "result.txt")
@@ -25,7 +27,7 @@
 import { appendFileSync } from "node:fs";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
-import type { AssistantMessage, Context, Model, SimpleStreamOptions } from "@earendil-works/pi-ai";
+import type { AssistantMessage, Context, Model, SimpleStreamOptions, ToolCall } from "@earendil-works/pi-ai";
 
 const env = (key: string, fallback: string) => process.env[key] ?? fallback;
 const WINDOW = Number(env("SC_FAKE_WINDOW", "100000"));
@@ -84,9 +86,9 @@ function trace(record: Record<string, unknown>) {
 
 interface Plan {
 	text?: string;
-	toolCall?: { name: string; arguments: Record<string, unknown> };
+	toolCall?: { name: string; arguments: ToolCall["arguments"] };
 	/** Extra calls emitted in the same batch (sibling tests). */
-	siblings?: Array<{ name: string; arguments: Record<string, unknown>; position: "before" | "after" }>;
+	siblings?: Array<{ name: string; arguments: ToolCall["arguments"]; position: "before" | "after" }>;
 	usageTotal: number;
 	stopReason: "stop" | "toolUse";
 }
@@ -220,12 +222,19 @@ function streamScripted(model: Model<any>, context: Context, options?: SimpleStr
 	const systemMessage = context.messages.find((m) => (m as { role: string }).role === "system") as { content?: unknown; sections?: Record<string, unknown> } | undefined;
 	const systemPrompt = context.systemPrompt ?? (textOf(systemMessage?.content) || Object.values(systemMessage?.sections ?? {}).filter((v) => typeof v === "string").join("\n\n"));
 	const isSummary = !(context.tools && context.tools.length > 0) && !systemPrompt.includes("<tools>");
+	// Capture the plan when the request starts, including pre-compaction usage.
+	const parallel = !isSummary && context.messages.some(m => /\[self-compact · COMPACTING\]/.test(textOf((m as { content?: unknown }).content)));
+	const plan = isSummary ? undefined : parallel
+		? { text: "Waiting for compaction.", usageTotal: WINDOW * 0.7, stopReason: "stop" as const }
+		: decide(context);
+	trace({ kind: "request", isSummary, parallel });
 	setTimeout(() => {
 		try {
+			if (options?.signal?.aborted) throw new Error("fake request aborted");
 			stream.push({ type: "start", partial: output });
 			if (isSummary) {
 				summaryCalls += 1;
-				trace({ kind: "summary", call: summaryCalls, systemPrompt: systemPrompt.slice(0, 200) });
+				trace({ kind: "summary", call: summaryCalls, systemPrompt, userPrompt: context.messages.filter(m => m.role === "user").map(m => textOf(m.content)).join("\n") });
 				if (summaryCalls <= SUMMARY_FAIL) {
 					throw new Error(`fake summary failure #${summaryCalls}`);
 				}
@@ -240,7 +249,7 @@ function streamScripted(model: Model<any>, context: Context, options?: SimpleStr
 				output.usage.totalTokens = 1050;
 				output.stopReason = "stop";
 			} else {
-				const plan = decide(context);
+				if (!plan) throw new Error("Missing scripted plan");
 				if (OVERFLOW && plan.usageTotal > WINDOW) {
 					trace({ kind: "overflow", usageTotal: plan.usageTotal });
 					throw new Error(`prompt is too long: ${plan.usageTotal} tokens > ${WINDOW} maximum`);
@@ -256,7 +265,7 @@ function streamScripted(model: Model<any>, context: Context, options?: SimpleStr
 					stream.push({ type: "text_end", contentIndex: index, content: plan.text, partial: output });
 					index += 1;
 				}
-				const emitCall = (name: string, args: Record<string, unknown>) => {
+				const emitCall = (name: string, args: ToolCall["arguments"]) => {
 					const id = `call_${Date.now()}_${Math.floor(Math.random() * 1e6)}`;
 					const toolCall = { type: "toolCall" as const, id, name, arguments: args };
 					output.content.push(toolCall);
@@ -283,7 +292,7 @@ function streamScripted(model: Model<any>, context: Context, options?: SimpleStr
 			stream.push({ type: "error", reason: output.stopReason, error: output });
 			stream.end();
 		}
-	}, 5);
+	}, isSummary ? Number(env("SC_FAKE_SUMMARY_DELAY", "5")) : parallel ? Number(env("SC_FAKE_PARALLEL_DELAY", "5")) : 5);
 	return stream;
 }
 

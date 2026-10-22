@@ -44,7 +44,7 @@ test("failed compaction keeps the note and the lock; /self-compact-now reuses th
 		assert.ok(failures.length >= 3, `expected at least 3 failed compactions, saw ${failures.length}`);
 		assert.match(String(finalFailure.message), /Note kept and tools stay locked/);
 		assert.ok(notifies(first.events, /retrying automatically/).length >= 1, "automatic retry announced");
-		assert.ok(notifies(first.events, /Summary generation failed after 2 attempts: .*fake summary failure/).length >= 1, "real error recorded");
+		assert.ok(notifies(first.events, /fake summary failure/).length >= 1, "real error recorded");
 
 		// Note retained in the session ledger (latest state snapshot).
 		const entries = await first.request({ type: "get_entries" });

@@ -76,7 +76,13 @@ test("shipped prompt files exist and carry live-value placeholders", () => {
 		assert.ok(placeholdersIn(warning).includes(key), `warning prompt should reference {{${key}}}`);
 	}
 	assert.match(warning, /hard cutoff/i);
-	assert.match(compaction, /## Next Steps/);
-	assert.match(compaction, /never invent completed work/i);
+	for (const rules of [compaction, BUILTIN_PROMPTS.compaction]) {
+		assert.match(rules, /note_to_self is delivered separately/);
+		assert.match(rules, /never invent completed work/i);
+		assert.match(rules, /verified.*unverified/);
+		assert.match(rules, /pending actions pending/);
+		assert.match(rules, /exact paths, commands, and error messages/);
+		assert.doesNotMatch(rules, /## |<read-files>|<modified-files>/);
+	}
 	assert.ok(placeholdersIn(FORCED_PROMPT).includes("forced_tokens"));
 });

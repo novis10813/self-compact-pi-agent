@@ -8,7 +8,7 @@
 export type HandoffStatus = "pending" | "compacting" | "failed" | "ready" | "done";
 
 export interface Handoff {
-	/** Durable id: carried in compaction details and in the handoff message details. */
+	/** Durable id: carried in state snapshots and handoff message details. */
 	id: string;
 	note: string;
 	status: HandoffStatus;
@@ -17,7 +17,7 @@ export interface Handoff {
 	error?: string;
 	/**
 	 * Set when the handoff fails: whether the failure is eligible for an automatic retry —
-	 * a genuine (not cancelled) compaction failure that is not deterministic. Drives both the
+	 * a non-deterministic failure, or cancellation while a parallel run is active. Drives both the
 	 * scheduled retry and the settled-agent retry; undefined on handoffs that never failed
 	 * (and on snapshots from older versions), so restored failures only retry through recovery.
 	 */
@@ -67,7 +67,7 @@ function isState(entry: EntryLike): entry is EntryLike & { data: PersistedState 
 
 /**
  * Rebuild state from branch entries (root -> leaf). The latest snapshot wins; the branch is then checked
- * for a compaction carrying the handoff id (summary landed) and for the journaled handoff message.
+ * for a compaction after this handoff was saved (summary landed) and for the journaled handoff message.
  */
 export function recoverState(entries: EntryLike[]): RecoveredState {
 	let state = emptyState();
@@ -88,7 +88,8 @@ export function recoverState(entries: EntryLike[]): RecoveredState {
 		return result;
 	}
 	if (h.status === "done") return result;
-	const compactionLanded = entries.some((e) => e.type === "compaction" && (e.details as { handoffId?: string } | undefined)?.handoffId === h.id);
+	const savedIndex = entries.findIndex(e => isState(e) && e.data.handoff?.id === h.id);
+	const compactionLanded = savedIndex !== -1 && entries.slice(savedIndex + 1).some(e => e.type === "compaction");
 	if (compactionLanded || h.status === "ready") state.handoff = { ...h, status: "ready" };
 	return result;
 }

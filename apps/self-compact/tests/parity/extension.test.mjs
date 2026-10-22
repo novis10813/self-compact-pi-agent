@@ -13,9 +13,10 @@ process.env.PI_CODING_AGENT_DIR = mkdtempSync(join(tmpdir(), 'self-compact-agent
 writeFileSync(join(process.env.PI_CODING_AGENT_DIR, 'settings.json'), '{}');
 
 const globalModules = execFileSync('npm', ['root', '-g'], { encoding: 'utf8' }).trim();
-const { loadExtensions } = await import(pathToFileURL(join(globalModules, '@earendil-works/pi-coding-agent/dist/core/extensions/loader.js')));
+const piDir = process.env.PI_DIR ?? join(globalModules, '@earendil-works/pi-coding-agent');
+const { loadExtensions } = await import(pathToFileURL(join(piDir, 'dist/core/extensions/loader.js')));
 // Pi's own compaction machinery: the harness precheck must track what prepareCompaction actually does.
-const { prepareCompaction } = await import(pathToFileURL(join(globalModules, '@earendil-works/pi-coding-agent/dist/core/compaction/compaction.js')));
+const { prepareCompaction } = await import(pathToFileURL(join(piDir, 'dist/core/compaction/compaction.js')));
 const entry = resolve('extensions/self-compact/self-compact.ts');
 
 function seedEntries(chars = 2000) {
@@ -93,36 +94,51 @@ async function host(t, flags = {}, settings = { compaction: { keepRecentTokens: 
   };
 }
 
-function summaryEvent(overrides = {}) {
-  return {
-    reason: 'manual', signal: new AbortController().signal,
-    preparation: {
-      messagesToSummarize: [{ role: 'user', content: 'Implement parser. Tests remain pending.', timestamp: 1 }],
-      turnPrefixMessages: [], isSplitTurn: false, firstKeptEntryId: 'keep', tokensBefore: 80000,
-      settings: { enabled: true, reserveTokens: 16384, keepRecentTokens: 1500 },
-      fileOps: { read: new Set(['README.md']), written: new Set(['parser.ts']), edited: new Set() },
-      ...overrides,
-    },
-  };
-}
+test('P1: native automatic compaction is never cancelled and can complete a pending handoff', async t => {
+  for (const reason of ['threshold', 'overflow']) {
+    const h = await host(t);
+    assert.equal(await h.emit('session_before_compact', { reason }), undefined);
+    assert.equal(await h.emit('tool_call', { toolName: 'read' }), undefined);
+    await h.execute();
+    const pending = structuredClone(lastState(h));
+    await h.emit('session_compact_failed', { reason, aborted: true });
+    await h.emit('session_compact_failed', { reason, aborted: false, errorMessage: 'provider failed' });
+    assert.deepEqual(lastState(h), pending, 'automatic failures do not mutate handoff state');
+    await h.emit('session_compact', { reason });
+    assert.equal(lastState(h).handoff.status, 'ready');
+    assert.equal(lastState(h).locked, false);
+    assert.equal(h.messages.length, 1);
+    await h.emit('agent_settled');
+    assert.equal(h.compactions.length, 0, 'native success needs no second compaction');
+    assert.equal(h.requests.length, 0, 'self-compact never generates a summary');
+  }
+});
 
-// Pi's normalizeContext lifts the summarization system prompt into a leading system message,
-// so the rewritten summary input lives in the user message of the request.
-const summaryUserText = request => request.messages.find(message => message.role === 'user').content[0].text;
-
-test('P1: automatic compaction cannot bypass the note, including before settlement', async t => {
+test('P1: native compaction without a handoff releases the forced lock', async t => {
   const h = await host(t);
-  for (const reason of ['threshold', 'overflow']) assert.deepEqual(await h.emit('session_before_compact', { reason }), { cancel: true });
-  assert.equal((await h.emit('tool_call', { toolName: 'read' })).block, true);
-  await h.execute();
-  assert.deepEqual(await h.emit('session_before_compact', { reason: 'threshold' }), { cancel: true });
-  await h.emit('session_compact_failed', { reason: 'threshold', aborted: true });
-  assert.equal(h.entries.filter(entry => entry.customType === 'self-compact-state').at(-1).data.handoff.status, 'pending');
-  await h.emit('agent_settled');
-  assert.equal(h.compactions.length, 1);
-  const result = await h.emit('session_before_compact', summaryEvent());
-  assert.ok(result.compaction);
-  assert.equal(h.requests[0].options.reasoningEffort, 'low');
+  h.usage(140000);
+  await h.emit('turn_end');
+  assert.equal(lastState(h).locked, true);
+  h.usage(null);
+  await h.emit('session_compact', { reason: 'threshold' });
+  assert.equal(lastState(h).locked, false);
+  assert.equal(lastState(h).cycle, 0);
+  assert.equal(h.messages.length, 0);
+});
+
+test('P2: self-compact passes flag, file and builtin additional instructions to Pi', async t => {
+  const fallback = await host(t);
+  await fallback.execute();
+  await fallback.emit('agent_settled');
+  assert.match(fallback.compactions[0].customInstructions, /note_to_self is delivered separately/);
+  for (const source of ['file', 'flag']) {
+    const h = await host(t, source === 'flag' ? { 'compact-prompt': 'LITERAL FLAG' } : {});
+    h.prompt('COMPACTION_MESSAGE', 'FILE INSTRUCTIONS');
+    await h.execute();
+    await h.emit('agent_settled');
+    assert.equal(h.compactions[0].customInstructions, source === 'flag' ? 'LITERAL FLAG' : 'FILE INSTRUCTIONS');
+    assert.equal(h.requests.length, 0);
+  }
 });
 
 test('P1: final-answer crossing requests one follow-up, soft advice does not', async t => {
@@ -172,7 +188,11 @@ test('P2: invalid prompt files report errors without replacing the operator inpu
   assert.equal(h.notices.filter(notice => /Prompt file is empty/.test(notice.message)).length, 1);
   assert.equal(await h.emit('tool_call', { toolName: 'read' }), undefined);
   h.prompt('COMPACTION_MESSAGE', '  ');
-  assert.deepEqual(await h.emit('session_before_compact', summaryEvent()), { cancel: true });
+  await h.execute();
+  await h.emit('agent_settled');
+  assert.equal(h.compactions.length, 1, 'invalid prompt does not block compaction');
+  assert.equal(h.compactions[0].customInstructions, undefined);
+  assert.ok(h.notices.some(notice => notice.type === 'error' && /compacting without additional instructions/.test(notice.message)));
   assert.equal(h.requests.length, 0);
   await h.info();
   assert.match(h.entries.at(-1).data.lines.join('\n'), /ERROR: Prompt file is empty/);
@@ -204,57 +224,8 @@ test('extension installs no custom footer and never sets a status line', async t
   assert.equal(h.statusCalls.length, 0, 'no setStatus in RPC mode');
 });
 
-test('P2: native engine preserves split turns, previous summaries, budgets and file metadata', async t => {
-  const h = await host(t, { 'compact-prompt': 'EXACT SYSTEM OVERRIDE' });
-  h.prompt('SUMMARY_INSTRUCTIONS', 'USER INSTRUCTIONS: preserve evidence.');
-  const event = summaryEvent({ previousSummary: 'Previous checkpoint.', isSplitTurn: true, turnPrefixMessages: [{ role: 'user', content: 'Continue parser tests.', timestamp: 2 }], settings: { reserveTokens: 1000, keepRecentTokens: 100 } });
-  event.customInstructions = 'Keep the failing test name.';
-  const result = await h.emit('session_before_compact', event);
-  assert.ok(result.compaction);
-  assert.equal(h.requests.length, 2);
-  assert.deepEqual(h.requests.map(({ options }) => options.maxTokens), [800, 500]);
-  for (const { request, options } of h.requests) {
-    assert.equal(request.systemPrompt, 'EXACT SYSTEM OVERRIDE');
-    assert.equal(options.reasoningEffort, 'low');
-    assert.match(summaryUserText(request), /USER INSTRUCTIONS.*preserve evidence/);
-    assert.match(summaryUserText(request), /Keep the failing test name/);
-    assert.doesNotMatch(summaryUserText(request), /Use this EXACT format/);
-  }
-  assert.match(summaryUserText(h.requests[0].request), /<previous-summary>\nPrevious checkpoint/);
-  assert.match(summaryUserText(h.requests[1].request), /Continue parser tests/);
-  assert.match(result.compaction.summary, /Turn Context \(split turn\)/);
-  assert.deepEqual(result.compaction.details.readFiles, ['README.md']);
-  assert.deepEqual(result.compaction.details.modifiedFiles, ['parser.ts']);
-  assert.equal(result.compaction.firstKeptEntryId, 'keep');
-});
 
-test('P2: configured transport retry applies inside each summary attempt', async t => {
-  const h = await host(t);
-  mkdirSync(join(h.ctx.cwd, '.pi'), { recursive: true });
-  writeFileSync(join(h.ctx.cwd, '.pi/settings.json'), JSON.stringify({ retry: { enabled: true, maxRetries: 1, baseDelayMs: 1 } }));
-  const complete = h.ctx.modelRegistry.complete;
-  let calls = 0;
-  h.ctx.modelRegistry.complete = async (...args) => {
-    const response = await complete(...args);
-    if (++calls === 1) return { ...response, stopReason: 'error', errorMessage: '503 Service unavailable' };
-    return response;
-  };
-  const result = await h.emit('session_before_compact', summaryEvent());
-  assert.equal(calls, 2);
-  assert.equal(result.compaction.details.selfCompact.attempt, 1, 'transport retry succeeds within the first logical summary attempt');
-});
 
-test('P2: empty, truncated and tool-calling summaries never become checkpoints', async t => {
-  for (const response of [
-    { content: [], stopReason: 'stop' },
-    { content: [{ type: 'text', text: 'Partial summary' }], stopReason: 'length' },
-    { content: [{ type: 'toolCall', id: 'bad', name: 'write', arguments: {} }], stopReason: 'toolUse' },
-  ]) {
-    const h = await host(t);
-    h.ctx.modelRegistry.complete = async () => response;
-    assert.deepEqual(await h.emit('session_before_compact', summaryEvent()), { cancel: true });
-  }
-});
 
 test('P4: view_context returns usage, percent, and thresholds as JSON and stays allowed under the lock', async t => {
   const h = await host(t);
@@ -330,42 +301,6 @@ async function assertPrecheckMatchesOracle(t, branch, settings, model) {
   return { oracle, host: h };
 }
 
-const compactEvent = preparation => ({ reason: 'manual', signal: new AbortController().signal, preparation });
-
-test('P6: real split-turn preparation is recognized and summary budgets follow Pi, not a fixed 8192 cap', async t => {
-  // Output cap 65536 > 8192 so Pi's 0.8x/0.5x reserveTokens budgets (26214/16384) exceed the old hard cap.
-  const model = { id: 'parity-model', provider: 'fake', contextWindow: 200000, maxTokens: 65536, api: 'openai-completions', reasoning: true };
-  const branch = sessionBranch([
-    { role: 'user', content: 'H'.repeat(800) },
-    { role: 'assistant', content: [{ type: 'text', text: 'I'.repeat(800) }] },
-    { role: 'user', content: 'turn two' },
-    { role: 'assistant', content: [{ type: 'text', text: 'J'.repeat(1200) }] },
-    { role: 'user', content: 'end' },
-  ]);
-  const preparation = prepareCompaction(branch, { enabled: true, reserveTokens: 32768, keepRecentTokens: 300 });
-  assert.ok(preparation, 'ground truth: Pi prepares a split-turn compaction');
-  assert.equal(preparation.isSplitTurn, true);
-  assert.equal(preparation.messagesToSummarize.length, 2);
-  assert.equal(preparation.turnPrefixMessages.length, 1);
-
-  const h = await host(t, {}, { compaction: { keepRecentTokens: 100 } }, model);
-  h.setBranch(branch);
-  const result = await h.emit('session_before_compact', compactEvent(preparation));
-  assert.ok(result.compaction, 'both the <conversation> and the # Conversation turn-prefix call are recognized');
-  assert.equal(h.requests.length, 2);
-  assert.deepEqual(h.requests.map(({ options }) => options.maxTokens), [26214, 16384], 'Pi-computed budgets are honored, not re-capped at 8192');
-  assert.match(summaryUserText(h.requests[0].request), /^<conversation>/);
-  assert.match(summaryUserText(h.requests[1].request), /^# Conversation/);
-  assert.match(summaryUserText(h.requests[1].request), /turn two/);
-  assert.match(result.compaction.summary, /Turn Context \(split turn\)/);
-
-  // The model output cap still clamps Pi's budget; the extension must pass the clamped value through.
-  const h2 = await host(t, {}, { compaction: { keepRecentTokens: 100 } }, { ...model, maxTokens: 20000 });
-  h2.setBranch(branch);
-  const result2 = await h2.emit('session_before_compact', compactEvent(preparation));
-  assert.ok(result2.compaction);
-  assert.deepEqual(h2.requests.map(({ options }) => options.maxTokens), [20000, 16384], 'model output cap clamps the budget, 8192 never re-enters');
-});
 
 test('P6: keepRecentTokens resolves through the active model like Pi getCompactionSettings', async t => {
   const settings = { compaction: { keepRecentTokens: 10000000, modelOverrides: { 'fake/parity-model': { keepRecentTokens: 50000 } } } };
@@ -384,8 +319,8 @@ test('P6: keepRecentTokens resolves through the active model like Pi getCompacti
     const saved = await h.execute();
     assert.equal(saved.terminate, true, 'matching model: precheck sees material past the override');
     assert.equal(h.entries.filter(entry => entry.customType === 'self-compact-state').at(-1).data.handoff.status, 'pending');
-    const result = await h.emit('session_before_compact', compactEvent(preparation));
-    assert.ok(result.compaction);
+    await h.emit('agent_settled');
+    assert.equal(h.compactions.length, 1);
   }
   // Non-matching model: the same branch and settings fall back to the ordinary 10000000 -> nothing to compact.
   {
@@ -425,10 +360,8 @@ test('P6: repeat-compaction boundary: precheck tracks the real prepareCompaction
     h.setBranch(branch);
     const saved = await h.execute();
     assert.equal(saved.terminate, true, 'precheck agrees with the real preparation');
-    const result = await h.emit('session_before_compact', compactEvent(preparation));
-    assert.ok(result.compaction);
-    assert.match(summaryUserText(h.requests[0].request), /<previous-summary>\nold work summarized/);
-    assert.match(result.compaction.summary, /Turn Context \(split turn\)/);
+    await h.emit('agent_settled');
+    assert.equal(h.compactions.length, 1, 'self-compact delegates the prepared material to Pi');
   }
   // Nothing past the boundary: the branch fits keepRecent after the compaction entry.
   {
@@ -502,12 +435,9 @@ test('P7: two consecutive compactions, older inside the retained range: precheck
   }
   assert.deepEqual([...verdicts].sort(), [false, true], 'sweep crossed the boundary in both directions');
 
-  // And the material preparation really compacts end to end.
   const { host: h } = await assertPrecheckMatchesOracle(t, branch, materialSettings);
-  const result = await h.emit('session_before_compact', compactEvent(material));
-  assert.ok(result.compaction);
-  assert.match(summaryUserText(h.requests[0].request), /<previous-summary>\nsecond pass/);
-  assert.match(result.compaction.summary, /Turn Context \(split turn\)/);
+  await h.emit('agent_settled');
+  assert.equal(h.compactions.length, 1, 'native precheck allows delegation');
 });
 
 test('P7: recovery omission (context_edit null) is invisible to the precheck, as to the oracle', async t => {
@@ -534,9 +464,7 @@ test('P7: recovery omission (context_edit null) is invisible to the precheck, as
 
 // ------------------------------------------------------------------ phase 2: core reliability fixes
 // Two failure classes change the extension's response to a compaction failure:
-//  - Deterministic errors (token cap, unrecognized summary input) repeat identically with the
-//    same parameters: the in-loop summary attempts stop early, the actual attempt count is
-//    reported, and the scheduled auto-retry is skipped — the operator must change model/settings.
+//  - Token-cap errors skip automatic retries until the operator changes model/settings.
 //  - A manual, non-aborted "nothing to compact" failure self-heals ONLY when the native
 //    precheck confirms there is no material AND the fresh usage percent is nonnull and below
 //    warning: the note is then delivered as is without counting a compaction cycle.
@@ -667,20 +595,14 @@ test('P8: self-heal never fires on an arbitrary error or an abort', async t => {
   }
 });
 
-test('P8: token cap is deterministic: exactly one summary attempt, no scheduled retry', async t => {
-  const { oracle: preparation, host: h } = await assertPrecheckMatchesOracle(t, materialBranch(), K100);
-  await h.emit('agent_settled'); // compaction in flight for the saved note
-  // Pi's token-cap answer (getSummarizationFailure on stopReason === "length").
-  const base = h.ctx.modelRegistry.complete;
-  h.ctx.modelRegistry.complete = async (...args) => ({ ...(await base(...args)), stopReason: 'length' });
-  const result = await h.emit('session_before_compact', compactEvent(preparation));
-  assert.deepEqual(result, { cancel: true });
-  assert.equal(h.requests.length, 1, 'exactly one summary attempt for the deterministic failure');
-  await h.emit('session_compact_failed', { reason: 'manual', aborted: true });
+test('P8: native token-cap failure is deterministic: no scheduled retry', async t => {
+  const { host: h } = await assertPrecheckMatchesOracle(t, materialBranch(), K100);
+  await h.emit('agent_settled');
+  await h.emit('session_compact_failed', { reason: 'manual', aborted: false, errorMessage: 'Summary generation hit the token cap' });
   const state = lastState(h);
   assert.equal(state.handoff.status, 'failed');
   assert.equal(state.handoff.attempts, 1);
-  assert.match(state.handoff.error, /after 1 attempt: .*generation hit the token cap/);
+  assert.equal(state.handoff.error, 'Summary generation hit the token cap');
   assert.equal(state.locked, true, 'note kept, tools stay locked');
   assert.equal(h.compactions.length, 1, 'only the original note-saved compaction');
   assert.equal(h.notices.filter(notice => /change the model or compaction settings/.test(notice.message)).length, 1, 'operator told to change model/settings');
@@ -692,42 +614,15 @@ test('P8: token cap is deterministic: exactly one summary attempt, no scheduled 
   assert.equal(h.compactions.length, 1, 'no scheduled auto-retry and no idle retry after a deterministic failure');
 });
 
-test('P8: unrecognized summary input is deterministic: exactly one summary attempt, no scheduled retry', async t => {
-  const { oracle: preparation, host: h } = await assertPrecheckMatchesOracle(t, materialBranch(), K100);
-  await h.emit('agent_settled');
-  // Pi's summary-input validation answer (replaceInstructions throws the same text here).
-  h.ctx.modelRegistry.complete = async (...args) => {
-    h.requests.push({ request: args[1], options: args[2] });
-    throw new Error('Unrecognized Pi summary input; cannot replace instructions safely.');
-  };
-  const result = await h.emit('session_before_compact', compactEvent(preparation));
-  assert.deepEqual(result, { cancel: true });
-  assert.equal(h.requests.length, 1, 'exactly one summary attempt for the deterministic failure');
-  await h.emit('session_compact_failed', { reason: 'manual', aborted: true });
-  const state = lastState(h);
-  assert.equal(state.handoff.status, 'failed');
-  assert.equal(state.handoff.attempts, 1);
-  assert.match(state.handoff.error, /after 1 attempt: Unrecognized Pi summary input/i);
-  assert.equal(h.notices.filter(notice => /deterministic/.test(notice.message)).length, 1, 'operator told auto-retry is skipped');
-  await wait(2500);
-  assert.equal(h.compactions.length, 1, 'no scheduled auto-retry after a deterministic failure');
-});
 
-test('P8: transient summary failure retains the original retry path', async t => {
-  const { oracle: preparation, host: h } = await assertPrecheckMatchesOracle(t, materialBranch(), K100);
+test('P8: native transient failure retains the original retry path', async t => {
+  const { host: h } = await assertPrecheckMatchesOracle(t, materialBranch(), K100);
   await h.emit('agent_settled');
-  h.ctx.modelRegistry.complete = async (...args) => {
-    h.requests.push({ request: args[1], options: args[2] });
-    throw new Error('transient provider hiccup');
-  };
-  const result = await h.emit('session_before_compact', compactEvent(preparation));
-  assert.deepEqual(result, { cancel: true });
-  assert.equal(h.requests.length, 2, 'both summary attempts run for a transient error');
-  await h.emit('session_compact_failed', { reason: 'manual', aborted: true });
+  await h.emit('session_compact_failed', { reason: 'manual', aborted: false, errorMessage: 'transient provider hiccup' });
   const state = lastState(h);
   assert.equal(state.handoff.status, 'failed');
   assert.equal(state.handoff.attempts, 1);
-  assert.match(state.handoff.error, /after 2 attempts: transient provider hiccup/);
+  assert.equal(state.handoff.error, 'transient provider hiccup');
   assert.equal(h.notices.filter(notice => /retrying automatically/.test(notice.message)).length, 1, 'auto-retry announced');
   await wait(2500); // retry delay for attempt 1
   assert.equal(h.compactions.length, 2, 'the scheduled auto-retry still fires');
@@ -736,13 +631,7 @@ test('P8: transient summary failure retains the original retry path', async t =>
 test('P8: transient failure: agent_settled is still eligible for the retry, and the timer does not double-start', async t => {
   const { host: h } = await assertPrecheckMatchesOracle(t, materialBranch(), K100);
   await h.emit('agent_settled');
-  h.ctx.modelRegistry.complete = async (...args) => {
-    h.requests.push({ request: args[1], options: args[2] });
-    throw new Error('transient provider hiccup');
-  };
-  assert.deepEqual(await h.emit('session_before_compact', compactEvent(prepareCompaction(materialBranch(), oracleFor(K100)))), { cancel: true });
-  assert.equal(h.requests.length, 2, 'both summary attempts run for a transient error');
-  await h.emit('session_compact_failed', { reason: 'manual', aborted: true });
+  await h.emit('session_compact_failed', { reason: 'manual', aborted: false, errorMessage: 'transient provider hiccup' });
   const state = lastState(h);
   assert.equal(state.handoff.status, 'failed');
   assert.equal(state.handoff.attempts, 1);
@@ -754,16 +643,10 @@ test('P8: transient failure: agent_settled is still eligible for the retry, and 
   assert.equal(h.compactions.length, 2, 'no double-start between the idle retry and the scheduled retry');
 });
 
-test('P8: stale deterministic error does not override a fresh manual no-material failure; self-heal uses the new error', async t => {
-  const { oracle: preparation, host: h } = await assertPrecheckMatchesOracle(t, materialBranch(), K100);
-  await h.emit('agent_settled'); // compaction in flight for the saved note
-  // Pi's token-cap answer (getSummarizationFailure on stopReason === "length") leaves a deterministic
-  // summary error behind. Without per-event consumption it would override the next failure's own error.
-  const base = h.ctx.modelRegistry.complete;
-  h.ctx.modelRegistry.complete = async (...args) => ({ ...(await base(...args)), stopReason: 'length' });
-  assert.deepEqual(await h.emit('session_before_compact', compactEvent(preparation)), { cancel: true });
-  assert.equal(h.requests.length, 1, 'deterministic failure: exactly one summary attempt');
-  await h.emit('session_compact_failed', { reason: 'manual', aborted: true });
+test('P8: fresh manual no-material failure self-heals after a native token-cap failure', async t => {
+  const { host: h } = await assertPrecheckMatchesOracle(t, materialBranch(), K100);
+  await h.emit('agent_settled');
+  await h.emit('session_compact_failed', { reason: 'manual', aborted: false, errorMessage: 'Summary generation hit the token cap' });
   const failed = lastState(h);
   assert.equal(failed.handoff.status, 'failed');
   assert.match(failed.handoff.error, /generation hit the token cap/);
@@ -788,9 +671,7 @@ test('P8: stale deterministic error does not override a fresh manual no-material
 test('P8: explicit tool retry with a saved failed note: no material below warning returns the original note exactly once', async t => {
   const { host: h } = await assertPrecheckMatchesOracle(t, materialBranch(), K100);
   await h.emit('agent_settled');
-  h.ctx.modelRegistry.complete = async () => { throw new Error('transient provider hiccup'); };
-  assert.deepEqual(await h.emit('session_before_compact', compactEvent(prepareCompaction(materialBranch(), oracleFor(K100)))), { cancel: true });
-  await h.emit('session_compact_failed', { reason: 'manual', aborted: true });
+  await h.emit('session_compact_failed', { reason: 'manual', aborted: false, errorMessage: 'transient provider hiccup' });
   const failed = lastState(h);
   assert.equal(failed.handoff.status, 'failed');
   const original = failed.handoff.note;
@@ -822,9 +703,7 @@ test('P8: tool retry guards: high or unknown usage stays locked with a truthful 
   const setup = async () => {
     const { host: h } = await assertPrecheckMatchesOracle(t, materialBranch(), K100);
     await h.emit('agent_settled');
-    h.ctx.modelRegistry.complete = async () => { throw new Error('transient provider hiccup'); };
-    assert.deepEqual(await h.emit('session_before_compact', compactEvent(prepareCompaction(materialBranch(), oracleFor(K100)))), { cancel: true });
-    await h.emit('session_compact_failed', { reason: 'manual', aborted: true });
+    await h.emit('session_compact_failed', { reason: 'manual', aborted: false, errorMessage: 'transient provider hiccup' });
     const failed = lastState(h);
     assert.equal(failed.handoff.status, 'failed');
     h.setBranch(smallBranch());
@@ -920,13 +799,11 @@ test('P9: failed handoff: FAILED guidance, blocked tools do not terminate, an up
   h.usage(110000);
   await h.execute('NEXT ACTION: original');
   await h.emit('agent_settled');
-  h.ctx.modelRegistry.complete = async () => { throw new Error('transient provider hiccup'); };
-  assert.deepEqual(await h.emit('session_before_compact', summaryEvent()), { cancel: true });
-  await h.emit('session_compact_failed', { reason: 'manual', aborted: true });
+  await h.emit('session_compact_failed', { reason: 'manual', aborted: false, errorMessage: 'transient provider hiccup' });
   const failed = lastState(h).handoff;
   assert.equal(failed.status, 'failed');
   const context = await h.emit('context', { messages: [] });
-  assert.match(context.messages[0].content, /^\[self-compact · FAILED\] The last compaction failed \(Summary generation failed/);
+  assert.match(context.messages[0].content, /^\[self-compact · FAILED\] The last compaction failed \(transient provider hiccup/);
   const blocked = await h.emit('tool_call', { toolName: 'bash', toolCallId: 'x' });
   assert.equal(blocked.block, true);
   assert.equal(blocked.terminate, undefined, 'the model must be able to call self_compact in this run');
@@ -958,6 +835,112 @@ test('P9: a run started during compaction: COMPACTING guidance, blocked tools an
   assert.match(result.content[0].text, /already in progress.*changed nothing/);
   assert.equal(lastState(h).handoff.note, 'NEXT ACTION: original', 'the note being compacted is untouched');
   assert.equal(h.compactions.length, 1, 'no second compaction');
+});
+
+test('B2: a response built before compaction cannot re-lock tools or emit guidance', async t => {
+  const h = await host(t);
+  await h.emit('context', { messages: [] });
+  await h.emit('session_compact', { reason: 'manual' });
+  h.usage(140000);
+  await h.emit('message_end', { message: { role: 'assistant' } });
+  let view = JSON.parse((await h.view()).content[0].text);
+  assert.equal(view.used_tokens, null);
+  assert.equal(view.level, 'unknown');
+  assert.equal(view.tools_locked, false);
+  assert.equal(await h.emit('tool_call', { toolName: 'read' }), undefined);
+  assert.equal((await h.emit('context', { messages: [] })).messages.length, 0, 'stale usage stays unknown until a new response');
+  h.usage(45000);
+  await h.emit('message_end', { message: { role: 'assistant' } });
+  view = JSON.parse((await h.view()).content[0].text);
+  assert.equal(view.used_tokens, 45000);
+  assert.equal(view.level, 'notice');
+});
+
+test('B3: only a cancellation during a parallel run retries, within the retry budget', async t => {
+  for (const parallel of [false, true]) {
+    const h = await host(t);
+    await h.execute();
+    await h.emit('agent_settled');
+    for (let attempt = 1; attempt <= (parallel ? 3 : 1); attempt++) {
+      if (parallel) await h.emit('before_agent_start', { systemPrompt: '' });
+      await h.emit('session_compact_failed', { reason: 'manual', aborted: true });
+      assert.equal(lastState(h).handoff.retryable, parallel);
+      assert.equal(lastState(h).handoff.error, 'compaction was cancelled');
+      assert.equal(lastState(h).handoff.attempts, attempt);
+      await h.emit('agent_settled');
+      assert.equal(h.compactions.length, parallel ? Math.min(attempt + 1, 3) : 1);
+    }
+  }
+});
+
+test('B3: a retry resets the parallel-run flag', async t => {
+  const h = await host(t);
+  await h.execute();
+  await h.emit('agent_settled');
+  await h.emit('before_agent_start', { systemPrompt: '' });
+  await h.emit('session_compact_failed', { reason: 'manual', aborted: true });
+  await h.emit('agent_settled');
+  await h.emit('session_compact_failed', { reason: 'manual', aborted: true });
+  assert.equal(lastState(h).handoff.retryable, false);
+});
+
+test('B3: operator cancellation after the parallel run ended does not retry', async t => {
+  const h = await host(t);
+  await h.execute();
+  await h.emit('agent_settled');
+  await h.emit('before_agent_start', { systemPrompt: '' });
+  await h.emit('agent_end');
+  await h.emit('agent_settled');
+  await h.emit('session_compact_failed', { reason: 'manual', aborted: true });
+  await h.emit('agent_settled');
+  assert.equal(lastState(h).handoff.retryable, false);
+  assert.equal(h.compactions.length, 1);
+});
+
+test('B3: a pending note survives native auto failure after the parallel run settles', async t => {
+  const h = await host(t);
+  h.ctx.isIdle = () => false;
+  await h.execute();
+  await h.emit('agent_settled');
+  const pending = structuredClone(lastState(h));
+  await h.emit('session_compact_failed', { reason: 'threshold', aborted: false, errorMessage: 'provider failed' });
+  assert.deepEqual(lastState(h), pending, 'native failure only refreshes UI');
+  await wait(50);
+  assert.equal(h.compactions.length, 0);
+  h.ctx.isIdle = () => true;
+  await wait(75);
+  assert.equal(h.compactions.length, 1, 'deferred settlement starts the saved handoff without another run');
+});
+
+test('B4: a busy retry timer reschedules instead of dropping the retry', async t => {
+  const h = await host(t);
+  await h.execute();
+  await h.emit('agent_settled');
+  h.ctx.isIdle = () => false;
+  await h.emit('session_compact_failed', { reason: 'manual', aborted: false, errorMessage: 'temporary failure' });
+  await wait(2200);
+  assert.equal(h.compactions.length, 1);
+  h.ctx.isIdle = () => true;
+  await wait(2200);
+  assert.equal(h.compactions.length, 2, 'retry survived the busy timer without a settlement event');
+});
+
+test('B5: repeated compaction while ready counts and delivers a note only once', async t => {
+  const h = await host(t);
+  await h.execute();
+  await h.emit('agent_settled');
+  h.ctx.isIdle = () => false;
+  await h.emit('session_compact', { reason: 'manual' });
+  await h.emit('session_compact', { reason: 'threshold' });
+  assert.equal(lastState(h).cycle, 1);
+  assert.equal(h.messages.length, 0);
+  h.ctx.isIdle = () => true;
+  await wait(75);
+  assert.equal(h.messages.length, 1, 'delivery timer survives a second compaction without another settlement');
+  await h.emit('session_compact', { reason: 'manual' });
+  await h.emit('agent_settled');
+  assert.equal(h.messages.length, 1, 'ready handoff is not sent again in the new epoch');
+  assert.equal(lastState(h).cycle, 1);
 });
 
 const configView = async h => JSON.parse((await h.view()).content[0].text);

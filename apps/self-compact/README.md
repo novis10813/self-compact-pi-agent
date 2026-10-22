@@ -15,7 +15,7 @@ pi -e extensions/self-compact/self-compact.ts --compact-soft-at 100k --compact-a
 | `--compact-soft-at` | notice line: awareness only, nothing changes | `10%` |
 | `--compact-at` | warning line: time to write a note and compact soon | `20%` |
 | `--compact-buffer` | allowance above the warning before every other tool is blocked (`0` = block at the warning) | `10%` (hard cutoff 30%) |
-| `--compact-prompt` | literal text that replaces the compaction summary system prompt | unset |
+| `--compact-prompt` | additional instructions appended to Pi’s summary prompt for self-compact-triggered compaction only | unset |
 
 CLI values are percentages of the model window (`20%`) or token counts (`270000`, `100k`, `1.5m`). In legacy CLI mode the hard cutoff is `min(warning + buffer, 90% of the window)`. Defaults live in `extensions/self-compact/defaults.ts`.
 
@@ -58,7 +58,7 @@ Settings are read at session start, session switch, tree navigation, or extensio
 - `self_compact(note_to_self)`: saves the note (1 to 24,000 chars), ends the run, compacts once idle, returns the note verbatim as the next message. Refuses when Pi would find nothing to compact (the session still fits inside `keepRecentTokens`).
 - `view_context()`: the agent's own gauge as JSON: used tokens, percent, window, level, the three thresholds, tokens left before each, lock state, cycle count. Allowed even while other tools are locked.
 - `/self-compact-info`: settings, resolved thresholds, usage, state, cycles, prompt sources, pending note. No model turn.
-- `/self-compact-now`: asks the agent to write its note and call `self_compact` (reuses a saved note on retry). Built-in `/compact` is untouched and uses the same summary prompt.
+- `/self-compact-now`: asks the agent to write its note and call `self_compact` (reuses a saved note on retry). Built-in `/compact` is untouched and does not use self-compact’s additional instructions.
 
 ## Prompt files
 
@@ -68,10 +68,11 @@ Settings are read at session start, session switch, tree navigation, or extensio
 | --- | --- |
 | `USER_PROMPT_SOFT_SELF_COMPACT.md` | transient message on each call past the notice line |
 | `USER_PROMPT_WARNING_SELF_COMPACT.md` | transient message on each call past the warning line |
-| `USER_PROMPT_COMPACTION_MESSAGE.md` | system prompt of the summary call (`--compact-prompt` overrides it) |
-| `USER_PROMPT_SUMMARY_INSTRUCTIONS.md` | optional: replaces Pi's user instructions for the summary call |
+| `USER_PROMPT_COMPACTION_MESSAGE.md` | extra rules appended via `customInstructions` when self-compact starts compaction (`--compact-prompt` overrides it, built-in extra rules are the fallback) |
 
-Placeholders: `{{used_tokens}}`, `{{used_percent}}`, `{{context_window}}`, `{{cached_tokens}}`, `{{soft_tokens}}`, `{{soft_percent}}`, `{{warning_tokens}}`, `{{warning_percent}}`, `{{forced_tokens}}`, `{{forced_percent}}`, `{{remaining_to_forced}}`, `{{cycle}}`, `{{note_max_chars}}`. Each threshold crossing also prints the rendered message once in the TUI. Empty or unreadable override files report an error instead of silently falling back.
+Placeholders: `{{used_tokens}}`, `{{used_percent}}`, `{{context_window}}`, `{{cached_tokens}}`, `{{soft_tokens}}`, `{{soft_percent}}`, `{{warning_tokens}}`, `{{warning_percent}}`, `{{forced_tokens}}`, `{{forced_percent}}`, `{{remaining_to_forced}}`, `{{cycle}}`, `{{note_max_chars}}`. Each threshold crossing also prints the rendered message once in the TUI. Empty or unreadable override files report an error. If the compaction instructions cannot be loaded, compaction still proceeds without extra rules.
+
+Pi’s built-in prompt defines the summary structure. Summary generation belongs to Pi, or pi-compaction-model when installed. `/compact` and native threshold/overflow compaction do not use these extra rules. Native auto compaction is not cancelled. Any successful compaction completes a pending handoff and unlocks tools. If a background run’s old-context response lands after compaction, its usage stays unknown until a fresh-context response arrives. Cancellation during such a parallel run can retry automatically, up to three failed attempts. Plain operator cancellation without a parallel run does not retry.
 
 ## Tests
 
@@ -94,7 +95,7 @@ extensions/self-compact/
   thresholds.ts     parse (tokens / k / m / %), validate, resolve against the window, level
   context-bar.ts    20-cell bar renderer
   prompts.ts        prompt lookup, templating, precedence, built-in fallbacks
-  summary.ts        native compaction call with the replacement prompt; nothing-to-compact check
+  summary.ts        Pi compaction precheck and resolved compaction settings
   state.ts          state snapshot, durable handoff id, recovery reducer
 .pi/self-compact/   the prompt files above
 tests/              unit, parity, harness (scripted provider, RPC client), e2e

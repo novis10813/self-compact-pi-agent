@@ -6,7 +6,7 @@ function snapshot(state: Partial<PersistedState> & { handoff?: PersistedState["h
 	return { type: "custom", customType: STATE_TYPE, data: { version: 1, cycle: 0, locked: false, ...state } };
 }
 const note = (status: PersistedState["handoff"] extends infer H ? (H extends { status: infer S } ? S : never) : never, extra: Record<string, unknown> = {}) => ({ id: "h1", note: "NEXT ACTION: write result.txt", status, attempts: 0, savedAt: 1, ...extra });
-const compactionFor = (id: string): EntryLike => ({ type: "compaction", details: { handoffId: id } });
+const compaction = (): EntryLike => ({ type: "compaction" });
 const handoffMessage = (id: string): EntryLike => ({ type: "custom_message", customType: HANDOFF_TYPE, details: { id } });
 const assistant: EntryLike = { type: "message", message: { role: "assistant", stopReason: "stop" } };
 const user: EntryLike = { type: "message", message: { role: "user" } };
@@ -22,26 +22,33 @@ test("pending note without a compaction stays pending; latest snapshot wins", ()
 	assert.equal(r.state.locked, true);
 });
 
-test("compaction carrying the handoff id means the summary landed: status ready", () => {
-	const r = recoverState([snapshot({ handoff: note("compacting"), locked: true }), compactionFor("h1")]);
+test("compaction after the saved handoff means the summary landed: status ready", () => {
+	const r = recoverState([snapshot({ handoff: note("compacting"), locked: true }), compaction()]);
 	assert.equal(r.state.handoff?.status, "ready");
 	assert.equal(r.journaledUnanswered, false);
 });
 
+test("only compactions after the first snapshot of the same handoff count", () => {
+	const old = snapshot({ handoff: note("done", { id: "older" }) });
+	const saved = snapshot({ handoff: note("pending"), locked: true });
+	assert.equal(recoverState([old, compaction(), saved]).state.handoff?.status, "pending");
+	assert.equal(recoverState([saved, compaction(), snapshot({ handoff: note("compacting") })]).state.handoff?.status, "ready");
+});
+
 test("journaled handoff message without an answer -> journaledUnanswered", () => {
-	const r = recoverState([snapshot({ handoff: note("ready"), cycle: 1 }), compactionFor("h1"), handoffMessage("h1")]);
+	const r = recoverState([snapshot({ handoff: note("ready"), cycle: 1 }), compaction(), handoffMessage("h1")]);
 	assert.equal(r.journaledUnanswered, true);
 	assert.equal(r.answered, false);
 });
 
 test("journaled handoff message with an assistant answer -> answered, never restarts", () => {
-	const r = recoverState([snapshot({ handoff: note("ready"), cycle: 1 }), compactionFor("h1"), handoffMessage("h1"), assistant]);
+	const r = recoverState([snapshot({ handoff: note("ready"), cycle: 1 }), compaction(), handoffMessage("h1"), assistant]);
 	assert.equal(r.answered, true);
 	assert.equal(r.journaledUnanswered, false);
 });
 
 test("done handoff whose journaled message was never answered still resumes", () => {
-	const r = recoverState([snapshot({ handoff: note("ready"), cycle: 1 }), compactionFor("h1"), handoffMessage("h1"), snapshot({ handoff: note("done"), cycle: 1 })]);
+	const r = recoverState([snapshot({ handoff: note("ready"), cycle: 1 }), compaction(), handoffMessage("h1"), snapshot({ handoff: note("done"), cycle: 1 })]);
 	assert.equal(r.state.handoff?.status, "done");
 	assert.equal(r.journaledUnanswered, true);
 	const answered = recoverState([snapshot({ handoff: note("done"), cycle: 1 }), handoffMessage("h1"), assistant]);
