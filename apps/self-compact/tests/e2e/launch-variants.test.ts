@@ -80,7 +80,10 @@ test("launch 3: 20% / 50% / 0 with --compact-prompt: zero buffer, literal additi
 		await client.waitFor((e) => e.type === "agent_settled", 60_000, { since: client.events.indexOf(handoff) });
 		const summaries = () => readFileSync(t.traceFile, "utf8").trim().split("\n").map(line => JSON.parse(line) as { kind: string; systemPrompt?: string; userPrompt?: string }).filter(item => item.kind === "summary");
 		const selfSummaries = summaries();
-		assert.equal(selfSummaries.length, 1);
+		// Durable user-role guidance can split Pi's retained turn, which uses a second
+		// summarizer request for the turn prefix. It is still one compaction.
+		assert.equal(client.events.filter(e => e.type === "compaction_end").length, 1);
+		assert.ok(selfSummaries.length === 1 || selfSummaries.length === 2);
 		assert.match(selfSummaries[0]!.systemPrompt!, /^You are a context summarization assistant/);
 		assert.ok(selfSummaries[0]!.userPrompt!.includes(`Additional focus: ${LITERAL_PROMPT}`));
 

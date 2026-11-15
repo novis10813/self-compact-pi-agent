@@ -174,8 +174,8 @@ test("a message queued after self_compact keeps the run going: the blocked react
 		// The queued message started another turn; the model reacted with a tool call, which was blocked with terminate.
 		const blocked = await client.waitFor((e) => e.type === "tool_execution_end" && e.toolName === "bash" && e.isError === true, 30_000, { since: after });
 		assert.match(messageText(blocked.result), /compaction starts as soon as this run ends/);
-		const turns = readFileSync(t.traceFile, "utf8").trim().split("\n").map((line) => JSON.parse(line) as { kind: string; lastText?: string });
-		assert.ok(turns.some((r) => r.kind === "turn" && /^\[self-compact · PENDING\]/.test(r.lastText ?? "")), "model saw the PENDING guidance");
+		const turns = readFileSync(t.traceFile, "utf8").trim().split("\n").map((line) => JSON.parse(line) as { kind: string; lastText?: string; guidance?: string[] });
+		assert.ok(turns.some((r) => r.kind === "turn" && r.guidance?.some(text => /^\[self-compact · PENDING\]/.test(text))), "model saw the persisted PENDING guidance even when a queued user message followed it");
 
 		// No further LLM call in that run: the next thing after the blocked batch is the idle compaction.
 		const compactionEnd = await client.waitFor((e) => e.type === "compaction_end", 60_000, { since: after });

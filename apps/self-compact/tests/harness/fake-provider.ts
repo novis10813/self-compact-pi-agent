@@ -223,7 +223,9 @@ function streamScripted(model: Model<any>, context: Context, options?: SimpleStr
 	const systemPrompt = context.systemPrompt ?? (textOf(systemMessage?.content) || Object.values(systemMessage?.sections ?? {}).filter((v) => typeof v === "string").join("\n\n"));
 	const isSummary = !(context.tools && context.tools.length > 0) && !systemPrompt.includes("<tools>");
 	// Capture the plan when the request starts, including pre-compaction usage.
-	const parallel = !isSummary && context.messages.some(m => /\[self-compact · COMPACTING\]/.test(textOf((m as { content?: unknown }).content)));
+	// A completed handoff supersedes retained historical COMPACTING snapshots.
+	const lastHandoff = context.messages.reduce((found, m, index) => m.role === "user" && textOf(m.content).trim() === (lastSentNote || NOTE).trim() ? index : found, -1);
+	const parallel = !isSummary && context.messages.slice(lastHandoff + 1).some(m => /\[self-compact · COMPACTING\]/.test(textOf((m as { content?: unknown }).content)));
 	const plan = isSummary ? undefined : parallel
 		? { text: "Waiting for compaction.", usageTotal: WINDOW * 0.7, stopReason: "stop" as const }
 		: decide(context);
@@ -255,7 +257,8 @@ function streamScripted(model: Model<any>, context: Context, options?: SimpleStr
 					throw new Error(`prompt is too long: ${plan.usageTotal} tokens > ${WINDOW} maximum`);
 				}
 				const lastMessage = context.messages[context.messages.length - 1];
-				trace({ kind: "turn", plan, lastRole: lastMessage?.role, lastText: lastMessage ? textOf((lastMessage as { content?: unknown }).content).slice(0, 400) : "", messages: context.messages.length });
+				trace({ kind: "turn", plan, lastRole: lastMessage?.role, lastText: lastMessage ? textOf((lastMessage as { content?: unknown }).content).slice(0, 400) : "", messages: context.messages.length,
+					guidance: context.messages.filter(m => m.role === "user").map(m => textOf(m.content)).filter(text => /^\[self-compact · /.test(text)) });
 				let index = 0;
 				if (plan.text) {
 					output.content.push({ type: "text", text: "" });

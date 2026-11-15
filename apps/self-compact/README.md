@@ -66,8 +66,8 @@ Settings are read at session start, session switch, tree navigation, or extensio
 
 | File | When the model sees it |
 | --- | --- |
-| `USER_PROMPT_SOFT_SELF_COMPACT.md` | transient message on each call past the notice line |
-| `USER_PROMPT_WARNING_SELF_COMPACT.md` | transient message on each call past the warning line |
+| `USER_PROMPT_SOFT_SELF_COMPACT.md` | saved snapshot when crossing the notice line |
+| `USER_PROMPT_WARNING_SELF_COMPACT.md` | saved snapshot when crossing the warning line |
 | `USER_PROMPT_COMPACTION_MESSAGE.md` | extra rules appended via `customInstructions` when self-compact starts compaction (`--compact-prompt` overrides it, built-in extra rules are the fallback) |
 
 Placeholders: `{{used_tokens}}`, `{{used_percent}}`, `{{context_window}}`, `{{cached_tokens}}`, `{{soft_tokens}}`, `{{soft_percent}}`, `{{warning_tokens}}`, `{{warning_percent}}`, `{{forced_tokens}}`, `{{forced_percent}}`, `{{remaining_to_forced}}`, `{{cycle}}`, `{{note_max_chars}}`. Each threshold crossing also prints the rendered message once in the TUI. Empty or unreadable override files report an error. If the compaction instructions cannot be loaded, compaction still proceeds without extra rules.

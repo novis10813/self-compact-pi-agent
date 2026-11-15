@@ -12,7 +12,7 @@ for (const abort of [false, true]) test(
 		const client = new RpcClient({
 			args: ["-e", join(HARNESS_DIR, "background-message.ts"), ...scriptedArgs(t, ["--compact-soft-at", "20%", "--compact-at", "50%", "--compact-buffer", "10%"])],
 			cwd: t.dir, logFile: t.logFile,
-			env: { ...DEFAULT_FAKE_ENV, SC_FAKE_TRACE: t.traceFile, SC_FAKE_SUMMARY_DELAY: "300", SC_FAKE_PARALLEL_DELAY: "600" },
+			env: { ...DEFAULT_FAKE_ENV, SC_FAKE_TRACE: t.traceFile, SC_FAKE_SUMMARY_DELAY: "300", SC_FAKE_PARALLEL_DELAY: "1200" },
 		});
 		try {
 			await client.request({ type: "prompt", message: "Start the scripted work." });
@@ -30,7 +30,8 @@ for (const abort of [false, true]) test(
 			const trace = readFileSync(t.traceFile, "utf8").trim().split("\n").map(line => JSON.parse(line) as { kind: string; parallel?: boolean });
 			assert.ok(trace.some(item => item.kind === "request" && item.parallel), "a real parallel model request started during compaction");
 			if (!abort) {
-				assert.equal(trace.filter(item => item.kind === "summary").length, 1, "only Pi generated a summary");
+				const summaryRequests = trace.filter(item => item.kind === "summary").length;
+				assert.ok(summaryRequests === 1 || summaryRequests === 2, "one Pi compaction may also summarize a split-turn prefix");
 				const lateResponse = client.events.findIndex(e => e.type === "message_end" && (e.message as { role?: string; content?: Array<{ text?: string }> })?.role === "assistant" && (e.message as { content: Array<{ text?: string }> }).content.some(block => block.text === "Waiting for compaction."));
 				assert.ok(lateResponse > client.events.indexOf(compactions[0]!), "the old-context response landed after compaction");
 			}

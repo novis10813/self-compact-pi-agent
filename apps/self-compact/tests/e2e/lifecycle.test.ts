@@ -1,8 +1,8 @@
 /**
  * Deterministic end-to-end lifecycle through the real CLI (`pi --mode rpc`) with the scripted
  * provider: notice -> warning -> forced lock -> self_compact -> compaction -> note returned
- * verbatim -> continuation writes result.txt = done. Guidance reaches the model as transient
- * messages (never persisted), so the transcript only carries the user's own prompt.
+ * verbatim -> continuation writes result.txt = done. Guidance reaches the model as saved
+ * snapshots without rewriting historical messages or starting additional notice turns.
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -74,7 +74,7 @@ test("lifecycle: thresholds, lock, self_compact, compaction, verbatim note, cont
 		assert.deepEqual(phases.slice(0, 3), ["notice", "warning", "forced"]);
 		assert.equal(eventsOfType(events, "agent_start").length, 2, "one run for the task, one run started by the handoff");
 
-		// 2. Guidance reached the model as transient messages with live values, and nothing extra was persisted.
+		// 2. Guidance reached the model as durable snapshots without starting extra runs.
 		const turns = trace(t.traceFile).filter((r) => r.kind === "turn");
 		const seen = (marker: RegExp) => turns.find((r) => marker.test(r.lastText ?? ""));
 		assert.ok(seen(/^\[self-compact · notice\]/), "model saw the notice guidance");
@@ -83,7 +83,8 @@ test("lifecycle: thresholds, lock, self_compact, compaction, verbatim note, cont
 		assert.match(warning!.lastText ?? "", /Hard cutoff at 120,000/, "warning carries the live forced token count");
 		assert.ok(seen(/^\[self-compact · FORCED\]/), "model saw the forced guidance");
 		const persistedRoles = eventsOfType(events, "message_end").map((e) => (e.message as { role?: string; customType?: string }).role + ":" + ((e.message as { customType?: string }).customType ?? ""));
-		assert.equal(persistedRoles.filter((r) => r.startsWith("custom:")).length, 1, "the only persisted custom message is the handoff");
+		assert.equal(persistedRoles.filter((r) => r === "custom:self-compact-handoff").length, 1);
+		assert.ok(persistedRoles.filter((r) => r === "custom:self-compact-guidance").length >= 3, "threshold snapshots persist for provider replay");
 		assert.equal(persistedRoles.filter((r) => r === "user:").length, 1, "the only user message is the user's prompt");
 
 		// 3. Forced lock blocked an ordinary tool with a reason that names self_compact.

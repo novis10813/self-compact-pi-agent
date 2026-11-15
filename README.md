@@ -79,12 +79,12 @@ The fix is to hand the agent the gauge and the hand-off. **Thresholds it can see
 
 | Phase | Trigger | What the agent gets | Tools |
 | --- | --- | --- | --- |
-| **notice** | usage crosses `--compact-soft-at` | one transient message with live numbers, optional guidance | all available |
-| **warning** | usage crosses `--compact-at` | "time to compact soon", refreshed on every call | all available |
+| **notice** | usage crosses `--compact-soft-at` | one saved usage snapshot, optional guidance | all available |
+| **warning** | usage crosses `--compact-at` | one saved "time to compact soon" snapshot | all available |
 | **forced** | usage crosses warning + `--compact-buffer` (capped at 90 %) | every tool call is blocked with a reason naming `self_compact` | **only `self_compact`** |
 | **handoff** | agent calls `self_compact({ note_to_self })` | note saved, run ends, compaction once idle, note returned verbatim | restored on success |
 
-The guidance never enters the model's persisted context: it is injected into the next model call and dropped. Each crossing prints the full notice, warning, or forced message once in the terminal so you see exactly what the agent sees. The footer is yours, not the model's: `view_context` gives the agent the same numbers (used tokens, percent, thresholds, tokens left) as JSON whenever it asks, so it never has to guess where it stands. The only messages that persist are your prompts and the returned note. If compaction fails or is cancelled, the note and the lock survive, the extension retries, and `/self-compact-now` or `/compact` finish the job. Reload, resume, and `/tree` rebuild the handoff from the session, and an answered handoff never restarts.
+Guidance is appended to the session once per threshold or handoff-state transition and remains in the model's history until normal compaction removes it. It is a snapshot, not a live reading. Keeping prior guidance intact avoids Claude bridge session restarts and prompt-cache rewrites. Each crossing prints the full notice, warning, or forced message once in the terminal so you see exactly what the agent sees. The footer is yours, not the model's: `view_context` gives the agent the same numbers (used tokens, percent, thresholds, tokens left) as JSON whenever it asks, so it never has to guess where it stands. Your prompts, guidance snapshots, and the returned note persist. If compaction fails or is cancelled, the note and the lock survive, the extension retries, and `/self-compact-now` or `/compact` finish the job. Reload, resume, and `/tree` rebuild the handoff from the session, and an answered handoff never restarts.
 
 > *The note is the contract. Content in, content out, byte for byte.*
 

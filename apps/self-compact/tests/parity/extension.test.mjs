@@ -41,7 +41,7 @@ async function host(t, flags = {}, settings = { compaction: { keepRecentTokens: 
   assert.deepEqual(loaded.errors, []);
   const extension = loaded.extensions[0];
   const entries = seedEntries(), messages = [], notices = [], compactions = [], requests = [];
-  const footerCalls = [], statusCalls = [];
+  const footerCalls = [], statusCalls = [], guidance = [];
   let tokens = 0;
   let lastEntryId = entries[entries.length - 1].id;
   const defaultFlags = options.useDefaultFlags === false ? {} : { 'compact-soft-at': '20%', 'compact-at': '50%', 'compact-buffer': '10%' };
@@ -53,7 +53,10 @@ async function host(t, flags = {}, settings = { compaction: { keepRecentTokens: 
     entries.push(entry);
     lastEntryId = entry.id;
   };
-  loaded.runtime.sendMessage = (message, options) => messages.push({ ...message, options });
+  loaded.runtime.sendMessage = (message, options) => {
+    const target = message.customType === 'self-compact-guidance' && options?.triggerTurn === false ? guidance : messages;
+    target.push({ ...message, options });
+  };
   const ctx = {
     cwd, mode: 'tui', hasUI: true, thinkingLevel: 'off',
     model: model ?? { id: 'parity-model', provider: 'fake', contextWindow: 200000, maxTokens: 8192, api: 'openai-completions', reasoning: true },
@@ -75,7 +78,7 @@ async function host(t, flags = {}, settings = { compaction: { keepRecentTokens: 
   t.after(async () => { await emit('session_shutdown'); rmSync(cwd, { recursive: true, force: true }); });
   await emit('session_start', { reason: 'start' });
   return {
-    ctx, entries, messages, notices, compactions, requests, emit,
+    ctx, entries, messages, guidance, notices, compactions, requests, emit,
     setBranch: next => {
       entries.length = 0;
       for (const entry of next) entries.push(entry);
@@ -123,7 +126,7 @@ test('P1: native compaction without a handoff releases the forced lock', async t
   await h.emit('session_compact', { reason: 'threshold' });
   assert.equal(lastState(h).locked, false);
   assert.equal(lastState(h).cycle, 0);
-  assert.equal(h.messages.length, 0);
+  assert.equal(h.messages.filter(message => message.options?.triggerTurn).length, 0);
 });
 
 test('P2: self-compact passes flag, file and builtin additional instructions to Pi', async t => {
@@ -145,29 +148,52 @@ test('P1: final-answer crossing requests one follow-up, soft advice does not', a
   const h = await host(t);
   h.usage(45000);
   await h.emit('agent_end');
-  assert.equal(h.messages.length, 0);
+  assert.equal(h.messages.filter(message => message.options?.triggerTurn).length, 0);
   h.usage(110000);
   await h.emit('agent_end');
   await h.emit('agent_end');
   assert.equal(h.messages.filter(message => message.options?.triggerTurn).length, 1);
   await h.execute();
   await h.emit('agent_end');
-  assert.equal(h.messages.length, 1);
+  assert.equal(h.messages.filter(message => message.options?.triggerTurn).length, 1);
 });
 
-test('P3: context refreshes one live guidance message and supports harness templates', async t => {
+test('P3: guidance is append-only and token updates never rewrite the provider prefix', async t => {
   const h = await host(t);
   h.prompt('SOFT_SELF_COMPACT', '{{context_tokens}} / {{context_window}} ({{context_percent}}%). {{remaining_tokens}} remain, warn {{warning_percent}}%.');
   h.usage(40000);
   const first = await h.emit('context', { messages: [] });
-  assert.equal(first.messages.length, 1);
-  assert.match(first.messages[0].content, /40,000 \/ 200,000 \(20.0%\).*160,000 remain, warn 50.0%/);
+  assert.deepEqual(first.messages, [], 'context hook does not inject transient messages');
+  assert.equal(h.guidance.length, 1);
+  const notice = structuredClone(h.guidance[0]);
+  assert.match(notice.content, /40,000 \/ 200,000 \(20.0%\).*160,000 remain, warn 50.0%/);
+  assert.equal(notice.options.triggerTurn, false);
+  const history = { messages: [{ role: 'custom', customType: notice.customType, content: notice.content, timestamp: 1 }] };
   h.usage(44000);
-  const second = await h.emit('context', first);
-  assert.equal(second.messages.length, 1);
-  assert.match(second.messages[0].content, /44,000.*22.0%/);
+  assert.deepEqual(await h.emit('context', history), history);
   h.prompt('SOFT_SELF_COMPACT', 'UPDATED {{context_tokens}}');
-  assert.match((await h.emit('context', second)).messages[0].content, /UPDATED 44,000/);
+  assert.deepEqual(await h.emit('context', history), history);
+  assert.equal(h.guidance.length, 1, 'same level does not append a changing token snapshot');
+  assert.deepEqual(h.guidance[0], notice);
+  h.usage(110000);
+  await h.emit('turn_end');
+  assert.equal(h.guidance.length, 2, 'warning appends without deleting the notice');
+  assert.deepEqual(h.guidance[0], notice);
+  await h.emit('turn_end');
+  assert.equal(h.guidance.length, 2, 'repeated boundary does not duplicate guidance');
+});
+
+test('P3: resume preserves the delivered snapshot without appending another token count', async t => {
+  const h = await host(t);
+  h.usage(45000);
+  await h.emit('turn_end');
+  const notice = h.guidance[0];
+  h.entries.push({ type: 'custom_message', id: 'saved-guidance', customType: notice.customType, content: notice.content, details: notice.details });
+  h.usage(49000);
+  await h.emit('session_start', { reason: 'resume' });
+  await h.emit('before_agent_start', { systemPrompt: 'test' });
+  await h.emit('context', { messages: [] });
+  assert.equal(h.guidance.length, 1, 'reload and first request do not duplicate the saved snapshot');
 });
 
 test('P3: tool preflight, turn boundary, and model change enforce newly crossed hard cutoff', async t => {
@@ -776,8 +802,9 @@ test('P9: messages after a saved note: blocked tools end the run, guidance expla
   assert.equal(saved.status, 'pending');
   // A queued message started another turn: the model sees PENDING guidance, and a blocked tool terminates the batch.
   const context = await h.emit('context', { messages: [{ role: 'user', content: 'background task finished', timestamp: 1 }] });
-  assert.equal(context.messages.length, 2);
-  assert.match(context.messages[1].content, /^\[self-compact · PENDING\]/);
+  assert.equal(context.messages.length, 1, 'context is not rewritten');
+  assert.match(h.guidance.at(-1).content, /^\[self-compact · PENDING\]/);
+  assert.equal(h.guidance.at(-1).options.triggerTurn, false);
   const blocked = await h.emit('tool_call', { toolName: 'bash', toolCallId: 'x' });
   assert.equal(blocked.block, true);
   assert.equal(blocked.terminate, true);
@@ -803,7 +830,8 @@ test('P9: failed handoff: FAILED guidance, blocked tools do not terminate, an up
   const failed = lastState(h).handoff;
   assert.equal(failed.status, 'failed');
   const context = await h.emit('context', { messages: [] });
-  assert.match(context.messages[0].content, /^\[self-compact · FAILED\] The last compaction failed \(transient provider hiccup/);
+  assert.equal(context.messages.length, 0);
+  assert.match(h.guidance.at(-1).content, /^\[self-compact · FAILED\] The last compaction failed \(transient provider hiccup/);
   const blocked = await h.emit('tool_call', { toolName: 'bash', toolCallId: 'x' });
   assert.equal(blocked.block, true);
   assert.equal(blocked.terminate, undefined, 'the model must be able to call self_compact in this run');
@@ -825,7 +853,8 @@ test('P9: a run started during compaction: COMPACTING guidance, blocked tools an
   assert.equal(lastState(h).handoff.status, 'compacting');
   // A background or subagent message with triggerTurn started a run while compaction is running.
   const context = await h.emit('context', { messages: [{ role: 'user', content: 'subagent finished', timestamp: 1 }] });
-  assert.match(context.messages[1].content, /^\[self-compact · COMPACTING\]/);
+  assert.equal(context.messages.length, 1);
+  assert.match(h.guidance.at(-1).content, /^\[self-compact · COMPACTING\]/);
   const blocked = await h.emit('tool_call', { toolName: 'bash', toolCallId: 'x' });
   assert.equal(blocked.block, true);
   assert.equal(blocked.terminate, true);
